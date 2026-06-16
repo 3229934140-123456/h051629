@@ -32,7 +32,11 @@ class Room {
   gameMode: string;
   customData: Record<string, unknown>;
   players: Map<string, PlayerConnection> = new Map();
+  spectators: Map<string, PlayerConnection> = new Map();
   createdAt: number;
+  isPaused = false;
+  pauseReason: string | null = null;
+  pausedAt: number | null = null;
 
   inputBuffer: InputBuffer;
   stateSynchronizer: StateSynchronizer;
@@ -44,9 +48,11 @@ class Room {
   private playerAckedFrames: Map<string, number> = new Map();
   private playerPredictedStates: Map<string, Map<number, { position: { x: number; y: number; z?: number }; velocity?: { x: number; y: number; z?: number } }>> = new Map();
   private sessionIdToPlayerId: Map<string, string> = new Map();
+  private spectatorSessionMap: Map<string, string> = new Map();
   private _lastCorrectionFrame: Map<string, number> = new Map();
   private syncTimer: NodeJS.Timeout | null = null;
   private deltaSyncTimer: NodeJS.Timeout | null = null;
+  private emptyRoomDestroyTimer: NodeJS.Timeout | null = null;
   private network: NetworkLayer;
   private config: ServerConfig;
   private reconnectingSessions: Map<string, { playerId: string; timeout: NodeJS.Timeout }> = new Map();
@@ -94,13 +100,25 @@ class Room {
   }
 
   stop(): void {
+    if (this.emptyRoomDestroyTimer) {
+      clearTimeout(this.emptyRoomDestroyTimer);
+      this.emptyRoomDestroyTimer = null;
+    }
+
     if (!this.isEmpty()) {
       for (const [playerId] of this.players) {
         this.removePlayer(playerId, 'Room closed');
       }
     }
 
+    for (const [spectatorId] of this.spectators) {
+      this.removeSpectator(spectatorId, 'Room closed');
+    }
+
     this.isRunning = false;
+    this.isPaused = false;
+    this.pauseReason = null;
+    this.pausedAt = null;
     this.gameLoop.stop();
     this.stopSyncTimers();
 
@@ -186,6 +204,16 @@ class Room {
       },
     }, player.id);
 
+    this.broadcastToSpectators({
+      type: MessageType.JOIN_ROOM,
+      timestamp: Date.now(),
+      payload: {
+        playerId: player.id,
+        sessionId: player.sessionId,
+        playerState: initialPlayerState,
+      },
+    });
+
     console.log(`[Room ${this.id}] Player ${player.id} joined. Total: ${this.players.size}/${this.maxPlayers}`);
 
     if (this.players.size >= 1 && !this.isRunning) {
@@ -228,6 +256,15 @@ class Room {
         },
       });
 
+      this.broadcastToSpectators({
+        type: MessageType.LEAVE_ROOM,
+        timestamp: Date.now(),
+        payload: {
+          playerId,
+          reason,
+        },
+      });
+
       console.log(`[Room ${this.id}] Player ${playerId} left. Reason: ${reason}. Remaining: ${this.players.size}`);
     } else {
       player.isConnected = false;
@@ -240,16 +277,43 @@ class Room {
           isTemporary: true,
         },
       });
-      console.log(`[Room ${this.id}] Player ${playerId} disconnected, keeping state for reconnect`);
+      this.broadcastToSpectators({
+        type: MessageType.LEAVE_ROOM,
+        timestamp: Date.now(),
+        payload: {
+          playerId,
+          reason: 'disconnect',
+          isTemporary: true,
+        },
+      });
+      console.log(`[Room ${this.id}] Player ${playerId} disconnected, keeping state for reconnect (${this.config.reconnectTimeoutMs}ms window)`);
     }
 
-    if (this.isEmpty() && this.isRunning) {
-      setTimeout(() => {
-        if (this.isEmpty()) {
-          this.stop();
-        }
-      }, 5000);
+    this.scheduleEmptyRoomDestroy();
+  }
+
+  private scheduleEmptyRoomDestroy(): void {
+    if (this.emptyRoomDestroyTimer) {
+      clearTimeout(this.emptyRoomDestroyTimer);
+      this.emptyRoomDestroyTimer = null;
     }
+
+    if (this.hasAnyActiveParticipants()) {
+      return;
+    }
+
+    const delay = Math.max(this.config.reconnectTimeoutMs, 5000);
+    console.log(`[Room ${this.id}] No active participants, scheduling room destruction in ${delay}ms`);
+
+    this.emptyRoomDestroyTimer = setTimeout(() => {
+      if (!this.hasAnyActiveParticipants()) {
+        console.log(`[Room ${this.id}] Destroy timeout reached with no active participants, stopping room`);
+        this.stop();
+      } else {
+        console.log(`[Room ${this.id}] Participants rejoined during destroy window, keeping room alive`);
+      }
+      this.emptyRoomDestroyTimer = null;
+    }, delay);
   }
 
   handleReconnect(newPlayerId: string, sessionId: string, lastKnownFrame: number, newConnection?: PlayerConnection): { success: boolean; reason?: string } {
@@ -368,6 +432,24 @@ class Room {
     });
 
     console.log(`[Room ${this.id}] Player ${newPlayerId} reconnected successfully. Session: ${sessionId.substring(0, 8)}..., Frame catchup: ${baseFrame} → ${currentFrame}`);
+
+    this.broadcastToSpectators({
+      type: MessageType.JOIN_ROOM,
+      timestamp: Date.now(),
+      payload: {
+        playerId: newPlayerId,
+        sessionId,
+        isReconnect: true,
+        originalPlayerId: originalPlayerId !== newPlayerId ? originalPlayerId : undefined,
+      },
+    });
+
+    if (this.emptyRoomDestroyTimer) {
+      clearTimeout(this.emptyRoomDestroyTimer);
+      this.emptyRoomDestroyTimer = null;
+      console.log(`[Room ${this.id}] Cancelled room destruction due to player reconnect`);
+    }
+
     return { success: true };
   }
 
@@ -386,6 +468,13 @@ class Room {
 
     this.reconnectingSessions.set(sessionId, { playerId, timeout });
     console.log(`[Room ${this.id}] Scheduled reconnect window for player ${playerId} (${this.config.reconnectTimeoutMs}ms)`);
+
+    if (this.emptyRoomDestroyTimer) {
+      clearTimeout(this.emptyRoomDestroyTimer);
+      this.emptyRoomDestroyTimer = null;
+      console.log(`[Room ${this.id}] Rescheduling room destruction to respect reconnect timeout`);
+    }
+    this.scheduleEmptyRoomDestroy();
   }
 
   processPlayerInput(playerId: string, input: PlayerInput): void {
@@ -422,7 +511,8 @@ class Room {
   }
 
   private sendFullSnapshots(): void {
-    if (this.players.size === 0) return;
+    const hasRecipients = this.players.size > 0 || this.spectators.size > 0;
+    if (!hasRecipients) return;
 
     const frame = this.gameLoop.getCurrentFrame();
     if (!this.stateSynchronizer.shouldSendFullSnapshot(frame)) return;
@@ -441,10 +531,23 @@ class Room {
       });
       this.lastDeltaFrame.set(playerId, frame);
     }
+
+    for (const [spectatorId] of this.spectators) {
+      this.network.send(spectatorId, {
+        type: MessageType.STATE_FULL,
+        timestamp: Date.now(),
+        payload: {
+          frame,
+          state: serialized,
+          isSpectator: true,
+        },
+      });
+    }
   }
 
   private sendDeltaUpdates(): void {
-    if (this.players.size === 0) return;
+    const hasRecipients = this.players.size > 0 || this.spectators.size > 0;
+    if (!hasRecipients) return;
 
     const currentFrame = this.gameLoop.getCurrentFrame();
 
@@ -468,6 +571,29 @@ class Room {
       });
 
       this.lastDeltaFrame.set(playerId, currentFrame);
+    }
+
+    for (const [spectatorId] of this.spectators) {
+      const baseFrame = this.lastDeltaFrame.get(spectatorId) ?? Math.max(0, currentFrame - 10);
+      
+      if (baseFrame >= currentFrame) continue;
+
+      const delta = this.stateSynchronizer.generateDelta(baseFrame, currentFrame);
+      if (!delta) continue;
+
+      const serializedDelta = {
+        ...delta,
+        playerUpdates: this.serializePlayerUpdates(delta.playerUpdates),
+        isSpectator: true,
+      };
+
+      this.network.send(spectatorId, {
+        type: MessageType.STATE_DELTA,
+        timestamp: Date.now(),
+        payload: serializedDelta,
+      });
+
+      this.lastDeltaFrame.set(spectatorId, currentFrame);
     }
   }
 
@@ -575,8 +701,268 @@ class Room {
     this.network.broadcast(playerIds, message, excludePlayerId);
   }
 
+  broadcastToSpectators<T>(message: Omit<NetworkMessage<T>, 'seq'>, excludeSpectatorId?: string): void {
+    const spectatorIds = Array.from(this.spectators.keys());
+    this.network.broadcast(spectatorIds, message, excludeSpectatorId);
+  }
+
+  broadcastToAll<T>(message: Omit<NetworkMessage<T>, 'seq'>, excludeId?: string): void {
+    this.broadcast(message, excludeId);
+    this.broadcastToSpectators(message, excludeId);
+  }
+
+  addSpectator(spectator: PlayerConnection): { success: boolean; reason?: string } {
+    if (this.spectators.has(spectator.id)) {
+      return { success: false, reason: 'Already spectating this room' };
+    }
+
+    this.spectators.set(spectator.id, spectator);
+    this.spectatorSessionMap.set(spectator.sessionId, spectator.id);
+    this.network.setRoomId(spectator.id, this.id);
+    this.lastDeltaFrame.set(spectator.id, 0);
+
+    const currentState = this.stateSynchronizer.serializeForReconnection();
+    const connectedPlayers = Array.from(this.players.values()).map(p => ({
+      id: p.id,
+      isConnected: p.isConnected,
+    }));
+
+    this.network.send(spectator.id, {
+      type: MessageType.JOIN_SPECTATOR_ACK,
+      timestamp: Date.now(),
+      payload: {
+        success: true,
+        roomId: this.id,
+        roomName: this.name,
+        spectatorId: spectator.id,
+        state: this.serializeGameStateForClient(currentState.state),
+        currentFrame: currentState.baseFrame,
+        tickRate: this.config.tickRate,
+        isPaused: this.isPaused,
+        pauseReason: this.pauseReason,
+        pausedAt: this.pausedAt,
+        players: connectedPlayers,
+        reconnectingCount: this.reconnectingSessions.size,
+        spectatorCount: this.spectators.size,
+      },
+    });
+
+    this.broadcastToAll({
+      type: MessageType.JOIN_SPECTATOR,
+      timestamp: Date.now(),
+      payload: {
+        spectatorId: spectator.id,
+        spectatorCount: this.spectators.size,
+      },
+    }, spectator.id);
+
+    if (this.emptyRoomDestroyTimer) {
+      clearTimeout(this.emptyRoomDestroyTimer);
+      this.emptyRoomDestroyTimer = null;
+    }
+
+    console.log(`[Room ${this.id}] Spectator ${spectator.id} joined. Total spectators: ${this.spectators.size}`);
+    return { success: true };
+  }
+
+  removeSpectator(spectatorId: string, reason: string = 'Spectator left'): void {
+    const spectator = this.spectators.get(spectatorId);
+    if (!spectator) return;
+
+    this.spectators.delete(spectatorId);
+    this.spectatorSessionMap.delete(spectator.sessionId);
+    this.lastDeltaFrame.delete(spectatorId);
+    this.network.setRoomId(spectatorId, null);
+
+    this.network.send(spectatorId, {
+      type: MessageType.LEAVE_SPECTATOR,
+      timestamp: Date.now(),
+      payload: {
+        roomId: this.id,
+        reason,
+      },
+    });
+
+    this.broadcastToAll({
+      type: MessageType.LEAVE_SPECTATOR,
+      timestamp: Date.now(),
+      payload: {
+        spectatorId,
+        spectatorCount: this.spectators.size,
+        reason,
+      },
+    });
+
+    console.log(`[Room ${this.id}] Spectator ${spectatorId} left. Reason: ${reason}. Remaining: ${this.spectators.size}`);
+    this.scheduleEmptyRoomDestroy();
+  }
+
+  getSpectator(spectatorId: string): PlayerConnection | undefined {
+    return this.spectators.get(spectatorId);
+  }
+
+  getAllSpectators(): PlayerConnection[] {
+    return Array.from(this.spectators.values());
+  }
+
+  pause(reason: string = 'Manual pause'): boolean {
+    if (!this.isRunning) {
+      return false;
+    }
+
+    this.isPaused = true;
+    this.pauseReason = reason;
+    this.pausedAt = Date.now();
+    this.gameLoop.stop();
+
+    this.broadcastToAll({
+      type: MessageType.ROOM_PAUSE,
+      timestamp: Date.now(),
+      payload: {
+        roomId: this.id,
+        reason,
+        pausedAt: this.pausedAt,
+        frame: this.getCurrentFrame(),
+      },
+    });
+
+    console.log(`[Room ${this.id}] Paused. Reason: ${reason}. Frame: ${this.getCurrentFrame()}`);
+    return true;
+  }
+
+  resume(): boolean {
+    if (!this.isRunning || !this.isPaused) {
+      return false;
+    }
+
+    const resumedFrame = this.getCurrentFrame();
+    this.isPaused = false;
+    this.pauseReason = null;
+    this.pausedAt = null;
+    this.gameLoop.start();
+
+    this.broadcastToAll({
+      type: MessageType.ROOM_RESUME,
+      timestamp: Date.now(),
+      payload: {
+        roomId: this.id,
+        resumedAt: Date.now(),
+        frame: resumedFrame,
+      },
+    });
+
+    console.log(`[Room ${this.id}] Resumed. Continuing from frame: ${resumedFrame}`);
+    return true;
+  }
+
+  sendChatMessage(senderId: string, text: string, senderName?: string): void {
+    const isSpectator = this.spectators.has(senderId);
+    const isPlayer = this.players.has(senderId);
+    if (!isSpectator && !isPlayer) return;
+
+    this.broadcastToAll({
+      type: MessageType.CHAT_MESSAGE,
+      timestamp: Date.now(),
+      payload: {
+        roomId: this.id,
+        senderId,
+        senderName: senderName ?? senderId,
+        isSpectator,
+        text,
+      },
+    });
+  }
+
+  getDebugStatus(): {
+    roomId: string;
+    roomName: string;
+    isRunning: boolean;
+    isPaused: boolean;
+    pauseReason: string | null;
+    pausedAt: number | null;
+    currentFrame: number;
+    createdAt: number;
+    onlinePlayers: Array<{ id: string; isConnected: boolean; sessionId: string; rtt: number }>;
+    reconnectingPlayers: Array<{ sessionId: string; playerId: string; timeoutRemainingMs: number }>;
+    spectators: Array<{ id: string; sessionId: string }>;
+    spectatorCount: number;
+    reconnectingCount: number;
+    playerCount: number;
+    maxPlayers: number;
+    hasEmptyRoomDestroyTimer: boolean;
+    emptyRoomDestroyRemainingMs: number | null;
+    gameLoopStats: unknown;
+  } {
+    const onlinePlayers = Array.from(this.players.values()).map(p => ({
+      id: p.id,
+      isConnected: p.isConnected,
+      sessionId: p.sessionId,
+      rtt: p.rtt,
+    }));
+
+    const now = Date.now();
+    const reconnectingPlayers: Array<{ sessionId: string; playerId: string; timeoutRemainingMs: number }> = [];
+    for (const [sessionId, entry] of this.reconnectingSessions) {
+      const entryTyped = entry as { playerId: string; timeout: NodeJS.Timeout & { _idleStart?: number; _idleTimeout?: number } };
+      const timeoutObj = entryTyped.timeout;
+      let remaining = -1;
+      if (timeoutObj._idleStart !== undefined && timeoutObj._idleTimeout !== undefined) {
+        const elapsed = now - timeoutObj._idleStart;
+        remaining = Math.max(0, timeoutObj._idleTimeout - elapsed);
+      }
+      reconnectingPlayers.push({
+        sessionId,
+        playerId: entryTyped.playerId,
+        timeoutRemainingMs: remaining,
+      });
+    }
+
+    const spectators = Array.from(this.spectators.values()).map(s => ({
+      id: s.id,
+      sessionId: s.sessionId,
+    }));
+
+    let emptyRoomDestroyRemaining: number | null = null;
+    if (this.emptyRoomDestroyTimer) {
+      const timerObj = this.emptyRoomDestroyTimer as NodeJS.Timeout & { _idleStart?: number; _idleTimeout?: number };
+      if (timerObj._idleStart !== undefined && timerObj._idleTimeout !== undefined) {
+        emptyRoomDestroyRemaining = Math.max(0, timerObj._idleTimeout - (now - timerObj._idleStart));
+      }
+    }
+
+    return {
+      roomId: this.id,
+      roomName: this.name,
+      isRunning: this.isRunning,
+      isPaused: this.isPaused,
+      pauseReason: this.pauseReason,
+      pausedAt: this.pausedAt,
+      currentFrame: this.getCurrentFrame(),
+      createdAt: this.createdAt,
+      onlinePlayers,
+      reconnectingPlayers,
+      spectators,
+      spectatorCount: this.spectators.size,
+      reconnectingCount: this.reconnectingSessions.size,
+      playerCount: this.getPlayerCount(),
+      maxPlayers: this.maxPlayers,
+      hasEmptyRoomDestroyTimer: this.emptyRoomDestroyTimer !== null,
+      emptyRoomDestroyRemainingMs: emptyRoomDestroyRemaining,
+      gameLoopStats: this.gameLoop.getStats(),
+    };
+  }
+
+  hasAnyActiveParticipants(): boolean {
+    const connectedPlayers = Array.from(this.players.values()).filter(p => p.isConnected).length;
+    const reconnectingCount = this.reconnectingSessions.size;
+    const spectatorCount = this.spectators.size;
+    return connectedPlayers > 0 || reconnectingCount > 0 || spectatorCount > 0;
+  }
+
   isEmpty(): boolean {
-    return Array.from(this.players.values()).filter(p => p.isConnected).length === 0;
+    const totalPlayers = this.players.size;
+    const reconnectingCount = this.reconnectingSessions.size;
+    return totalPlayers === 0 && reconnectingCount === 0;
   }
 
   isFull(): boolean {
@@ -585,6 +971,14 @@ class Room {
 
   getPlayerCount(): number {
     return Array.from(this.players.values()).filter(p => p.isConnected).length;
+  }
+
+  getReconnectingCount(): number {
+    return this.reconnectingSessions.size;
+  }
+
+  getSpectatorCount(): number {
+    return this.spectators.size;
   }
 
   getPlayer(playerId: string): PlayerConnection | undefined {
@@ -618,6 +1012,7 @@ class Room {
 export class RoomManager extends EventEmitter {
   private rooms: Map<string, Room> = new Map();
   private playerToRoom: Map<string, string> = new Map();
+  private spectatorToRoom: Map<string, string> = new Map();
   private sessionToPlayer: Map<string, string> = new Map();
   private network: NetworkLayer;
   private config: ServerConfig;
@@ -635,12 +1030,21 @@ export class RoomManager extends EventEmitter {
     });
 
     this.network.on('disconnection', (player: PlayerConnection) => {
-      const roomId = this.playerToRoom.get(player.id);
-      if (roomId) {
-        const room = this.rooms.get(roomId);
+      const playerRoomId = this.playerToRoom.get(player.id);
+      if (playerRoomId) {
+        const room = this.rooms.get(playerRoomId);
         if (room) {
           room.removePlayer(player.id, 'Disconnected', true);
           room.scheduleReconnect(player.id, player.sessionId);
+        }
+      }
+
+      const spectatorRoomId = this.spectatorToRoom.get(player.id);
+      if (spectatorRoomId) {
+        const room = this.rooms.get(spectatorRoomId);
+        if (room) {
+          room.removeSpectator(player.id, 'Disconnected');
+          this.spectatorToRoom.delete(player.id);
         }
       }
     });
@@ -655,26 +1059,73 @@ export class RoomManager extends EventEmitter {
   }
 
   private handleNetworkMessage(player: PlayerConnection, message: NetworkMessage): void {
-    const roomId = this.playerToRoom.get(player.id);
+    const playerRoomId = this.playerToRoom.get(player.id);
+    const spectatorRoomId = this.spectatorToRoom.get(player.id);
+    const anyRoomId = playerRoomId ?? spectatorRoomId;
 
     switch (message.type) {
       case MessageType.JOIN_ROOM:
         this.handleJoinRoom(player, message.payload as { roomId?: string; roomName?: string; createIfNotExists?: boolean });
         break;
       case MessageType.LEAVE_ROOM:
-        if (roomId) {
+        if (playerRoomId) {
           this.leaveRoom(player.id);
         }
         break;
       case MessageType.PLAYER_INPUT:
-        if (roomId) {
-          const room = this.rooms.get(roomId);
-          if (room) {
+        if (playerRoomId) {
+          const room = this.rooms.get(playerRoomId);
+          if (room && !room.isPaused) {
             const inputPayload = message.payload as PlayerInput;
             room.processPlayerInput(player.id, {
               ...inputPayload,
               playerId: player.id,
             });
+          }
+        }
+        break;
+      case MessageType.JOIN_SPECTATOR:
+        this.handleJoinSpectator(player, message.payload as { roomId: string });
+        break;
+      case MessageType.LEAVE_SPECTATOR:
+        if (spectatorRoomId) {
+          this.leaveSpectator(player.id);
+        }
+        break;
+      case MessageType.ROOM_PAUSE:
+        if (anyRoomId) {
+          const room = this.rooms.get(anyRoomId);
+          if (room) {
+            room.pause((message.payload as { reason?: string })?.reason ?? 'Client requested pause');
+          }
+        }
+        break;
+      case MessageType.ROOM_RESUME:
+        if (anyRoomId) {
+          const room = this.rooms.get(anyRoomId);
+          if (room) {
+            room.resume();
+          }
+        }
+        break;
+      case MessageType.ROOM_STATUS:
+        if (anyRoomId) {
+          const room = this.rooms.get(anyRoomId);
+          if (room) {
+            this.network.send(player.id, {
+              type: MessageType.ROOM_STATUS,
+              timestamp: Date.now(),
+              payload: room.getDebugStatus(),
+            });
+          }
+        }
+        break;
+      case MessageType.CHAT_MESSAGE:
+        if (anyRoomId) {
+          const room = this.rooms.get(anyRoomId);
+          if (room) {
+            const chatPayload = message.payload as { text: string; senderName?: string };
+            room.sendChatMessage(player.id, chatPayload.text, chatPayload.senderName);
           }
         }
         break;
@@ -775,6 +1226,53 @@ export class RoomManager extends EventEmitter {
     } else {
       this.network.sendError(newConnection.id, result.reason ?? 'Reconnect failed');
     }
+  }
+
+  private handleJoinSpectator(
+    spectator: PlayerConnection,
+    payload: { roomId: string }
+  ): void {
+    if (this.playerToRoom.has(spectator.id) || this.spectatorToRoom.has(spectator.id)) {
+      this.network.sendError(spectator.id, 'Already in a room (as player or spectator)');
+      return;
+    }
+
+    const room = this.rooms.get(payload.roomId);
+    if (!room) {
+      this.network.sendError(spectator.id, 'Room not found');
+      return;
+    }
+
+    const result = room.addSpectator(spectator);
+    if (!result.success) {
+      this.network.sendError(spectator.id, result.reason ?? 'Failed to join as spectator');
+      return;
+    }
+
+    this.spectatorToRoom.set(spectator.id, room.id);
+    this.emit('spectator-joined', { roomId: room.id, spectatorId: spectator.id });
+    console.log(`[RoomManager] Spectator ${spectator.id} joined room ${room.id}`);
+  }
+
+  leaveSpectator(spectatorId: string): boolean {
+    const roomId = this.spectatorToRoom.get(spectatorId);
+    if (!roomId) return false;
+
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      this.spectatorToRoom.delete(spectatorId);
+      return false;
+    }
+
+    room.removeSpectator(spectatorId);
+    this.spectatorToRoom.delete(spectatorId);
+    this.emit('spectator-left', { roomId, spectatorId });
+    return true;
+  }
+
+  getSpectatorRoom(spectatorId: string): Room | undefined {
+    const roomId = this.spectatorToRoom.get(spectatorId);
+    return roomId ? this.rooms.get(roomId) : undefined;
   }
 
   findOrCreateRoom(options: RoomOptions = {}): Room {
