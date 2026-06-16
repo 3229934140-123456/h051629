@@ -55,13 +55,17 @@ export class GameServer {
     console.log('========================================');
     console.log();
     console.log('Available commands:');
-    console.log('  status           - Show server statistics');
-    console.log('  rooms            - List all active rooms');
-    console.log('  players          - List all connected players');
-    console.log('  room <roomId>    - Show detailed debug status for a room');
-    console.log('  pause <roomId>   - Pause game loop for a room');
-    console.log('  resume <roomId>  - Resume game loop for a room');
-    console.log('  shutdown         - Gracefully shutdown the server');
+    console.log('  status                      - Show server statistics');
+    console.log('  rooms                       - List all active rooms');
+    console.log('  players                     - List all connected players');
+    console.log('  room <roomId>               - Show detailed debug status for a room');
+    console.log('  pause <roomId>              - Pause game loop for a room');
+    console.log('  resume <roomId>             - Resume game loop for a room');
+    console.log('  kick <roomId> <playerId>    - Kick a player from room');
+    console.log('  lock <roomId>               - Lock room (no new players)');
+    console.log('  unlock <roomId>             - Unlock room');
+    console.log('  announce <roomId> <text>    - Send system announcement');
+    console.log('  shutdown                    - Gracefully shutdown the server');
     console.log();
   }
 
@@ -200,9 +204,12 @@ if (require.main === module) {
             isPaused: boolean;
             pauseReason: string | null;
             pausedAt: number | null;
+            isLocked: boolean;
+            lockReason: string | null;
+            lockedAt: number | null;
             currentFrame: number;
             createdAt: number;
-            onlinePlayers: Array<{ id: string; isConnected: boolean; sessionId: string; rtt: number }>;
+            onlinePlayers: Array<{ id: string; sessionId: string; rtt: number }>;
             reconnectingPlayers: Array<{ sessionId: string; playerId: string; timeoutRemainingMs: number }>;
             spectators: Array<{ id: string; sessionId: string }>;
             spectatorCount: number;
@@ -212,11 +219,13 @@ if (require.main === module) {
             hasEmptyRoomDestroyTimer: boolean;
             emptyRoomDestroyRemainingMs: number | null;
             gameLoopStats: unknown;
+            recentEvents?: Array<{ id: string; type: string; timestamp: number; data: Record<string, unknown> }>;
           };
           console.log(`\n[Room Debug Status] ${status.roomName}`);
           console.log(`  Room ID:        ${status.roomId}`);
           console.log(`  Running:        ${status.isRunning}`);
           console.log(`  Paused:         ${status.isPaused}${status.pauseReason ? ` (${status.pauseReason})` : ''}`);
+          console.log(`  Locked:         ${status.isLocked}${status.lockReason ? ` (${status.lockReason})` : ''}`);
           console.log(`  Current Frame:  ${status.currentFrame}`);
           console.log(`  Created At:     ${new Date(status.createdAt).toISOString()}`);
           console.log(`  Players:        ${status.playerCount}/${status.maxPlayers} (connected)`);
@@ -231,7 +240,7 @@ if (require.main === module) {
             console.log('    (none)');
           } else {
             status.onlinePlayers.forEach((p) => {
-              console.log(`    - ${p.id.substring(0, 16)}... Connected=${p.isConnected}, RTT=${p.rtt}ms`);
+              console.log(`    - ${p.id.substring(0, 16)}..., RTT=${p.rtt}ms`);
               console.log(`      Session: ${p.sessionId.substring(0, 16)}...`);
             });
           }
@@ -254,6 +263,17 @@ if (require.main === module) {
             status.spectators.forEach((s) => {
               console.log(`    - ${s.id.substring(0, 16)}...`);
               console.log(`      Session: ${s.sessionId.substring(0, 16)}...`);
+            });
+          }
+          console.log();
+          console.log('  [Recent Events]');
+          if (!status.recentEvents || status.recentEvents.length === 0) {
+            console.log('    (none)');
+          } else {
+            status.recentEvents.forEach((e) => {
+              const timeStr = new Date(e.timestamp).toLocaleTimeString();
+              console.log(`    [${timeStr}] ${e.type}`);
+              console.log(`      ${JSON.stringify(e.data)}`);
             });
           }
           console.log();
@@ -293,6 +313,70 @@ if (require.main === module) {
           console.log(ok ? `Room ${roomId} resumed successfully` : `Failed to resume room ${roomId} (not running or not paused?)`);
           break;
         }
+        case 'kick': {
+          if (args.length < 2) {
+            console.log('Usage: kick <roomId> <playerId> [reason]');
+            break;
+          }
+          const roomId = args[0];
+          const playerId = args[1];
+          const reason = args.slice(2).join(' ') || 'Kicked by admin';
+          const room = server.getRoomManager().getRoom(roomId);
+          if (!room) {
+            console.log(`Room not found: ${roomId}`);
+            break;
+          }
+          const ok = room.kickPlayer(playerId, reason);
+          console.log(ok ? `Player ${playerId} kicked from room ${roomId}` : `Failed to kick player ${playerId} (not found?)`);
+          break;
+        }
+        case 'lock': {
+          if (args.length === 0) {
+            console.log('Usage: lock <roomId> [reason]');
+            break;
+          }
+          const roomId = args[0];
+          const reason = args.slice(1).join(' ') || 'Admin locked';
+          const room = server.getRoomManager().getRoom(roomId);
+          if (!room) {
+            console.log(`Room not found: ${roomId}`);
+            break;
+          }
+          const ok = room.lock(reason);
+          console.log(ok ? `Room ${roomId} locked successfully` : `Failed to lock room ${roomId} (already locked?)`);
+          break;
+        }
+        case 'unlock': {
+          if (args.length === 0) {
+            console.log('Usage: unlock <roomId>');
+            break;
+          }
+          const roomId = args[0];
+          const room = server.getRoomManager().getRoom(roomId);
+          if (!room) {
+            console.log(`Room not found: ${roomId}`);
+            break;
+          }
+          const ok = room.unlock();
+          console.log(ok ? `Room ${roomId} unlocked successfully` : `Failed to unlock room ${roomId} (not locked?)`);
+          break;
+        }
+        case 'announce': {
+          if (args.length < 2) {
+            console.log('Usage: announce <roomId> <text>');
+            break;
+          }
+          const roomId = args[0];
+          const text = args.slice(1).join(' ');
+          const room = server.getRoomManager().getRoom(roomId);
+          if (!room) {
+            console.log(`Room not found: ${roomId}`);
+            break;
+          }
+          room.sendSystemAnnouncement(text);
+          console.log(`Announcement sent to room ${roomId}`);
+          break;
+        }
         case 'shutdown':
         case 'quit':
         case 'exit':
@@ -300,14 +384,18 @@ if (require.main === module) {
           break;
         case 'help':
           console.log('\nAvailable commands:');
-          console.log('  status           - Show server statistics');
-          console.log('  rooms            - List all active rooms');
-          console.log('  players          - List all connected players');
-          console.log('  room <roomId>    - Show detailed debug status for a room');
-          console.log('  pause <roomId>   - Pause game loop for a room');
-          console.log('  resume <roomId>  - Resume game loop for a room');
-          console.log('  shutdown         - Gracefully shutdown the server');
-          console.log('  help             - Show this help message');
+          console.log('  status                      - Show server statistics');
+          console.log('  rooms                       - List all active rooms');
+          console.log('  players                     - List all connected players');
+          console.log('  room <roomId>               - Show detailed debug status for a room');
+          console.log('  pause <roomId>              - Pause game loop for a room');
+          console.log('  resume <roomId>             - Resume game loop for a room');
+          console.log('  kick <roomId> <playerId>    - Kick a player from room');
+          console.log('  lock <roomId>               - Lock room (no new players)');
+          console.log('  unlock <roomId>             - Unlock room');
+          console.log('  announce <roomId> <text>    - Send system announcement');
+          console.log('  shutdown                    - Gracefully shutdown the server');
+          console.log('  help                        - Show this help message');
           console.log();
           break;
         case '':

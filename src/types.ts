@@ -42,11 +42,39 @@ export enum MessageType {
   JOIN_SPECTATOR = 60,
   JOIN_SPECTATOR_ACK = 61,
   LEAVE_SPECTATOR = 62,
+  ROOM_EVENT = 63,
   ROOM_PAUSE = 70,
   ROOM_RESUME = 71,
   ROOM_STATUS = 72,
+  ROOM_STATUS_SIMPLE = 73,
+  KICK_PLAYER = 74,
+  LOCK_ROOM = 75,
+  UNLOCK_ROOM = 76,
+  SYSTEM_ANNOUNCEMENT = 77,
   CHAT_MESSAGE = 80,
   ERROR = 99,
+}
+
+export enum RoomEventType {
+  PLAYER_JOINED = 'player_joined',
+  PLAYER_LEFT = 'player_left',
+  PLAYER_DISCONNECTED = 'player_disconnected',
+  PLAYER_RECONNECTED = 'player_reconnected',
+  PLAYER_KICKED = 'player_kicked',
+  SPECTATOR_JOINED = 'spectator_joined',
+  SPECTATOR_LEFT = 'spectator_left',
+  ROOM_PAUSED = 'room_paused',
+  ROOM_RESUMED = 'room_resumed',
+  ROOM_LOCKED = 'room_locked',
+  ROOM_UNLOCKED = 'room_unlocked',
+  SYSTEM_ANNOUNCEMENT = 'system_announcement',
+}
+
+export interface RoomEvent {
+  id: string;
+  type: RoomEventType;
+  timestamp: number;
+  data: Record<string, unknown>;
 }
 
 export interface NetworkMessage<T = unknown> {

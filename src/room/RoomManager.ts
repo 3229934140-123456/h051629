@@ -8,6 +8,8 @@ import {
   PlayerState,
   GameState,
   PlayerInput,
+  RoomEvent,
+  RoomEventType,
 } from '../types';
 import { NetworkLayer } from '../network/NetworkLayer';
 import { InputBuffer } from '../input/InputBuffer';
@@ -37,6 +39,9 @@ class Room {
   isPaused = false;
   pauseReason: string | null = null;
   pausedAt: number | null = null;
+  isLocked = false;
+  lockReason: string | null = null;
+  lockedAt: number | null = null;
 
   inputBuffer: InputBuffer;
   stateSynchronizer: StateSynchronizer;
@@ -56,6 +61,8 @@ class Room {
   private network: NetworkLayer;
   private config: ServerConfig;
   private reconnectingSessions: Map<string, { playerId: string; timeout: NodeJS.Timeout }> = new Map();
+  private eventHistory: RoomEvent[] = [];
+  private maxEventHistory = 100;
 
   constructor(
     options: RoomOptions,
@@ -90,6 +97,32 @@ class Room {
     this.checkAndSendCorrections(frame);
   }
 
+  private addEvent(type: RoomEventType, data: Record<string, unknown>): RoomEvent {
+    const event: RoomEvent = {
+      id: uuidv4(),
+      type,
+      timestamp: Date.now(),
+      data,
+    };
+
+    this.eventHistory.push(event);
+    if (this.eventHistory.length > this.maxEventHistory) {
+      this.eventHistory.shift();
+    }
+
+    this.broadcastToAll({
+      type: MessageType.ROOM_EVENT,
+      timestamp: event.timestamp,
+      payload: event,
+    });
+
+    return event;
+  }
+
+  getRecentEvents(count: number = 20): RoomEvent[] {
+    return this.eventHistory.slice(-count);
+  }
+
   start(): void {
     if (this.isRunning) return;
     
@@ -119,6 +152,9 @@ class Room {
     this.isPaused = false;
     this.pauseReason = null;
     this.pausedAt = null;
+    this.isLocked = false;
+    this.lockReason = null;
+    this.lockedAt = null;
     this.gameLoop.stop();
     this.stopSyncTimers();
 
@@ -126,6 +162,7 @@ class Room {
       clearTimeout(timeout);
     }
     this.reconnectingSessions.clear();
+    this.eventHistory.length = 0;
 
     console.log(`[Room ${this.id}] Stopped`);
   }
@@ -152,6 +189,10 @@ class Room {
   }
 
   addPlayer(player: PlayerConnection): { success: boolean; reason?: string } {
+    if (this.isLocked) {
+      return { success: false, reason: 'Room is locked' };
+    }
+
     if (this.players.size >= this.maxPlayers) {
       return { success: false, reason: 'Room is full' };
     }
@@ -216,6 +257,11 @@ class Room {
 
     console.log(`[Room ${this.id}] Player ${player.id} joined. Total: ${this.players.size}/${this.maxPlayers}`);
 
+    this.addEvent(RoomEventType.PLAYER_JOINED, {
+      playerId: player.id,
+      sessionId: player.sessionId,
+    });
+
     if (this.players.size >= 1 && !this.isRunning) {
       this.start();
     }
@@ -265,6 +311,12 @@ class Room {
         },
       });
 
+      this.addEvent(RoomEventType.PLAYER_LEFT, {
+        playerId,
+        sessionId: player.sessionId,
+        reason,
+      });
+
       console.log(`[Room ${this.id}] Player ${playerId} left. Reason: ${reason}. Remaining: ${this.players.size}`);
     } else {
       player.isConnected = false;
@@ -286,6 +338,13 @@ class Room {
           isTemporary: true,
         },
       });
+
+      this.addEvent(RoomEventType.PLAYER_DISCONNECTED, {
+        playerId,
+        sessionId: player.sessionId,
+        reconnectTimeoutMs: this.config.reconnectTimeoutMs,
+      });
+
       console.log(`[Room ${this.id}] Player ${playerId} disconnected, keeping state for reconnect (${this.config.reconnectTimeoutMs}ms window)`);
     }
 
@@ -444,6 +503,12 @@ class Room {
       },
     });
 
+    this.addEvent(RoomEventType.PLAYER_RECONNECTED, {
+      playerId: newPlayerId,
+      sessionId,
+      originalPlayerId: originalPlayerId !== newPlayerId ? originalPlayerId : undefined,
+    });
+
     if (this.emptyRoomDestroyTimer) {
       clearTimeout(this.emptyRoomDestroyTimer);
       this.emptyRoomDestroyTimer = null;
@@ -475,6 +540,72 @@ class Room {
       console.log(`[Room ${this.id}] Rescheduling room destruction to respect reconnect timeout`);
     }
     this.scheduleEmptyRoomDestroy();
+  }
+
+  kickPlayer(playerId: string, reason: string = 'Kicked by admin'): boolean {
+    const player = this.players.get(playerId);
+    if (!player) return false;
+
+    const sessionId = player.sessionId;
+
+    const reconnectEntry = this.reconnectingSessions.get(sessionId);
+    if (reconnectEntry) {
+      clearTimeout(reconnectEntry.timeout);
+      this.reconnectingSessions.delete(sessionId);
+    }
+
+    this.removePlayer(playerId, reason);
+
+    this.addEvent(RoomEventType.PLAYER_KICKED, {
+      playerId,
+      sessionId,
+      reason,
+    });
+
+    console.log(`[Room ${this.id}] Player ${playerId} kicked. Reason: ${reason}`);
+    return true;
+  }
+
+  lock(reason: string = 'Admin locked'): boolean {
+    if (this.isLocked) return false;
+
+    this.isLocked = true;
+    this.lockReason = reason;
+    this.lockedAt = Date.now();
+
+    this.addEvent(RoomEventType.ROOM_LOCKED, { reason });
+
+    console.log(`[Room ${this.id}] Locked. Reason: ${reason}`);
+    return true;
+  }
+
+  unlock(): boolean {
+    if (!this.isLocked) return false;
+
+    this.isLocked = false;
+    this.lockReason = null;
+    this.lockedAt = null;
+
+    this.addEvent(RoomEventType.ROOM_UNLOCKED, {});
+
+    console.log(`[Room ${this.id}] Unlocked`);
+    return true;
+  }
+
+  sendSystemAnnouncement(text: string): void {
+    this.broadcastToAll({
+      type: MessageType.SYSTEM_ANNOUNCEMENT,
+      timestamp: Date.now(),
+      payload: {
+        roomId: this.id,
+        text,
+        timestamp: Date.now(),
+      },
+    });
+
+    this.addEvent(RoomEventType.SYSTEM_ANNOUNCEMENT, { text });
+
+    console.log(`[Room ${this.id}] System announcement: ${text}`);
   }
 
   processPlayerInput(playerId: string, input: PlayerInput): void {
@@ -727,6 +858,8 @@ class Room {
       isConnected: p.isConnected,
     }));
 
+    const recentEvents = this.getRecentEvents(20);
+
     this.network.send(spectator.id, {
       type: MessageType.JOIN_SPECTATOR_ACK,
       timestamp: Date.now(),
@@ -741,9 +874,12 @@ class Room {
         isPaused: this.isPaused,
         pauseReason: this.pauseReason,
         pausedAt: this.pausedAt,
+        isLocked: this.isLocked,
+        lockReason: this.lockReason,
         players: connectedPlayers,
         reconnectingCount: this.reconnectingSessions.size,
         spectatorCount: this.spectators.size,
+        recentEvents,
       },
     });
 
@@ -755,6 +891,11 @@ class Room {
         spectatorCount: this.spectators.size,
       },
     }, spectator.id);
+
+    this.addEvent(RoomEventType.SPECTATOR_JOINED, {
+      spectatorId: spectator.id,
+      sessionId: spectator.sessionId,
+    });
 
     if (this.emptyRoomDestroyTimer) {
       clearTimeout(this.emptyRoomDestroyTimer);
@@ -793,6 +934,12 @@ class Room {
       },
     });
 
+    this.addEvent(RoomEventType.SPECTATOR_LEFT, {
+      spectatorId,
+      sessionId: spectator.sessionId,
+      reason,
+    });
+
     console.log(`[Room ${this.id}] Spectator ${spectatorId} left. Reason: ${reason}. Remaining: ${this.spectators.size}`);
     this.scheduleEmptyRoomDestroy();
   }
@@ -826,6 +973,11 @@ class Room {
       },
     });
 
+    this.addEvent(RoomEventType.ROOM_PAUSED, {
+      reason,
+      frame: this.getCurrentFrame(),
+    });
+
     console.log(`[Room ${this.id}] Paused. Reason: ${reason}. Frame: ${this.getCurrentFrame()}`);
     return true;
   }
@@ -851,6 +1003,10 @@ class Room {
       },
     });
 
+    this.addEvent(RoomEventType.ROOM_RESUMED, {
+      frame: resumedFrame,
+    });
+
     console.log(`[Room ${this.id}] Resumed. Continuing from frame: ${resumedFrame}`);
     return true;
   }
@@ -873,16 +1029,47 @@ class Room {
     });
   }
 
-  getDebugStatus(): {
+  getSimpleStatus(): {
+    roomId: string;
+    roomName: string;
+    isRunning: boolean;
+    isPaused: boolean;
+    isLocked: boolean;
+    currentFrame: number;
+    playerCount: number;
+    reconnectingCount: number;
+    spectatorCount: number;
+    maxPlayers: number;
+    createdAt: number;
+  } {
+    return {
+      roomId: this.id,
+      roomName: this.name,
+      isRunning: this.isRunning,
+      isPaused: this.isPaused,
+      isLocked: this.isLocked,
+      currentFrame: this.getCurrentFrame(),
+      playerCount: this.getPlayerCount(),
+      reconnectingCount: this.reconnectingSessions.size,
+      spectatorCount: this.spectators.size,
+      maxPlayers: this.maxPlayers,
+      createdAt: this.createdAt,
+    };
+  }
+
+  getDebugStatus(includeRecentEvents: boolean = true): {
     roomId: string;
     roomName: string;
     isRunning: boolean;
     isPaused: boolean;
     pauseReason: string | null;
     pausedAt: number | null;
+    isLocked: boolean;
+    lockReason: string | null;
+    lockedAt: number | null;
     currentFrame: number;
     createdAt: number;
-    onlinePlayers: Array<{ id: string; isConnected: boolean; sessionId: string; rtt: number }>;
+    onlinePlayers: Array<{ id: string; sessionId: string; rtt: number }>;
     reconnectingPlayers: Array<{ sessionId: string; playerId: string; timeoutRemainingMs: number }>;
     spectators: Array<{ id: string; sessionId: string }>;
     spectatorCount: number;
@@ -892,13 +1079,15 @@ class Room {
     hasEmptyRoomDestroyTimer: boolean;
     emptyRoomDestroyRemainingMs: number | null;
     gameLoopStats: unknown;
+    recentEvents?: RoomEvent[];
   } {
-    const onlinePlayers = Array.from(this.players.values()).map(p => ({
-      id: p.id,
-      isConnected: p.isConnected,
-      sessionId: p.sessionId,
-      rtt: p.rtt,
-    }));
+    const onlinePlayers = Array.from(this.players.values())
+      .filter(p => p.isConnected)
+      .map(p => ({
+        id: p.id,
+        sessionId: p.sessionId,
+        rtt: p.rtt,
+      }));
 
     const now = Date.now();
     const reconnectingPlayers: Array<{ sessionId: string; playerId: string; timeoutRemainingMs: number }> = [];
@@ -930,13 +1119,16 @@ class Room {
       }
     }
 
-    return {
+    const result = {
       roomId: this.id,
       roomName: this.name,
       isRunning: this.isRunning,
       isPaused: this.isPaused,
       pauseReason: this.pauseReason,
       pausedAt: this.pausedAt,
+      isLocked: this.isLocked,
+      lockReason: this.lockReason,
+      lockedAt: this.lockedAt,
       currentFrame: this.getCurrentFrame(),
       createdAt: this.createdAt,
       onlinePlayers,
@@ -950,6 +1142,11 @@ class Room {
       emptyRoomDestroyRemainingMs: emptyRoomDestroyRemaining,
       gameLoopStats: this.gameLoop.getStats(),
     };
+
+    if (includeRecentEvents) {
+      return { ...result, recentEvents: this.getRecentEvents(20) };
+    }
+    return result;
   }
 
   hasAnyActiveParticipants(): boolean {
@@ -1117,6 +1314,58 @@ export class RoomManager extends EventEmitter {
               timestamp: Date.now(),
               payload: room.getDebugStatus(),
             });
+          }
+        }
+        break;
+      case MessageType.ROOM_STATUS_SIMPLE:
+        if (anyRoomId) {
+          const room = this.rooms.get(anyRoomId);
+          if (room) {
+            this.network.send(player.id, {
+              type: MessageType.ROOM_STATUS_SIMPLE,
+              timestamp: Date.now(),
+              payload: room.getSimpleStatus(),
+            });
+          }
+        }
+        break;
+      case MessageType.KICK_PLAYER:
+        if (playerRoomId) {
+          const room = this.rooms.get(playerRoomId);
+          if (room) {
+            const kickPayload = message.payload as { targetPlayerId: string; reason?: string };
+            const ok = room.kickPlayer(kickPayload.targetPlayerId, kickPayload.reason ?? 'Kicked');
+            if (ok) {
+              this.playerToRoom.delete(kickPayload.targetPlayerId);
+            }
+          }
+        }
+        break;
+      case MessageType.LOCK_ROOM:
+        if (playerRoomId) {
+          const room = this.rooms.get(playerRoomId);
+          if (room) {
+            room.lock((message.payload as { reason?: string })?.reason ?? 'Locked');
+          }
+        }
+        break;
+      case MessageType.UNLOCK_ROOM:
+        if (playerRoomId) {
+          const room = this.rooms.get(playerRoomId);
+          if (room) {
+            room.unlock();
+          }
+        }
+        break;
+      case MessageType.SYSTEM_ANNOUNCEMENT:
+        if (playerRoomId || spectatorRoomId) {
+          const roomId = playerRoomId ?? spectatorRoomId;
+          if (roomId) {
+            const room = this.rooms.get(roomId);
+            if (room) {
+              const annPayload = message.payload as { text: string };
+              room.sendSystemAnnouncement(annPayload.text);
+            }
           }
         }
         break;
