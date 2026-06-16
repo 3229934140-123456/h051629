@@ -43,6 +43,8 @@ export enum MessageType {
   JOIN_SPECTATOR_ACK = 61,
   LEAVE_SPECTATOR = 62,
   ROOM_EVENT = 63,
+  ROOM_EVENTS_QUERY = 64,
+  ROOM_EVENTS_QUERY_ACK = 65,
   ROOM_PAUSE = 70,
   ROOM_RESUME = 71,
   ROOM_STATUS = 72,
@@ -70,11 +72,42 @@ export enum RoomEventType {
   SYSTEM_ANNOUNCEMENT = 'system_announcement',
 }
 
+export enum RoomEventCategory {
+  PLAYER = 'player',
+  SPECTATOR = 'spectator',
+  ADMIN = 'admin',
+  SYSTEM = 'system',
+}
+
+export enum ReconnectStatus {
+  FRESH = 'fresh',
+  NORMAL = 'normal',
+  WARNING = 'warning',
+  EXPIRED = 'expired',
+}
+
+export enum AnnouncementTarget {
+  ALL = 'all',
+  PLAYERS_ONLY = 'players_only',
+  SPECTATORS_ONLY = 'spectators_only',
+}
+
 export interface RoomEvent {
   id: string;
   type: RoomEventType;
+  category: RoomEventCategory;
   timestamp: number;
+  frame: number;
+  actorId?: string;
+  actorType?: 'player' | 'spectator' | 'admin' | 'system';
   data: Record<string, unknown>;
+  snapshot?: {
+    playerCount: number;
+    spectatorCount: number;
+    isPaused: boolean;
+    isLocked: boolean;
+    currentFrame: number;
+  };
 }
 
 export interface NetworkMessage<T = unknown> {

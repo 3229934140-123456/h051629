@@ -10,6 +10,9 @@ import {
   PlayerInput,
   RoomEvent,
   RoomEventType,
+  RoomEventCategory,
+  ReconnectStatus,
+  AnnouncementTarget,
 } from '../types';
 import { NetworkLayer } from '../network/NetworkLayer';
 import { InputBuffer } from '../input/InputBuffer';
@@ -60,9 +63,10 @@ class Room {
   private emptyRoomDestroyTimer: NodeJS.Timeout | null = null;
   private network: NetworkLayer;
   private config: ServerConfig;
-  private reconnectingSessions: Map<string, { playerId: string; timeout: NodeJS.Timeout }> = new Map();
+  private reconnectingSessions: Map<string, { playerId: string; timeout: NodeJS.Timeout; disconnectedAt: number }> = new Map();
   private eventHistory: RoomEvent[] = [];
-  private maxEventHistory = 100;
+  private maxEventHistory = 200;
+  private lastAnnouncement: { text: string; timestamp: number; target: AnnouncementTarget; senderId?: string } | null = null;
 
   constructor(
     options: RoomOptions,
@@ -97,12 +101,36 @@ class Room {
     this.checkAndSendCorrections(frame);
   }
 
-  private addEvent(type: RoomEventType, data: Record<string, unknown>): RoomEvent {
+  private addEvent(
+    type: RoomEventType,
+    category: RoomEventCategory,
+    data: Record<string, unknown>,
+    options?: { actorId?: string; actorType?: 'player' | 'spectator' | 'admin' | 'system'; includeSnapshot?: boolean }
+  ): RoomEvent {
+    const now = Date.now();
+    const currentFrame = this.getCurrentFrame();
+
+    let snapshot: RoomEvent['snapshot'] | undefined;
+    if (options?.includeSnapshot ?? true) {
+      snapshot = {
+        playerCount: this.getPlayerCount(),
+        spectatorCount: this.spectators.size,
+        isPaused: this.isPaused,
+        isLocked: this.isLocked,
+        currentFrame,
+      };
+    }
+
     const event: RoomEvent = {
       id: uuidv4(),
       type,
-      timestamp: Date.now(),
+      category,
+      timestamp: now,
+      frame: currentFrame,
+      actorId: options?.actorId,
+      actorType: options?.actorType,
       data,
+      snapshot,
     };
 
     this.eventHistory.push(event);
@@ -121,6 +149,42 @@ class Room {
 
   getRecentEvents(count: number = 20): RoomEvent[] {
     return this.eventHistory.slice(-count);
+  }
+
+  queryEvents(options?: {
+    categories?: RoomEventCategory[];
+    types?: RoomEventType[];
+    since?: number;
+    until?: number;
+    limit?: number;
+  }): RoomEvent[] {
+    let results = [...this.eventHistory];
+
+    if (options?.categories && options.categories.length > 0) {
+      results = results.filter(e => options.categories!.includes(e.category));
+    }
+
+    if (options?.types && options.types.length > 0) {
+      results = results.filter(e => options.types!.includes(e.type));
+    }
+
+    if (options?.since !== undefined) {
+      results = results.filter(e => e.timestamp >= options.since!);
+    }
+
+    if (options?.until !== undefined) {
+      results = results.filter(e => e.timestamp <= options.until!);
+    }
+
+    if (options?.limit && options.limit > 0) {
+      results = results.slice(-options.limit);
+    }
+
+    return results;
+  }
+
+  getEventById(eventId: string): RoomEvent | undefined {
+    return this.eventHistory.find(e => e.id === eventId);
   }
 
   start(): void {
@@ -257,10 +321,10 @@ class Room {
 
     console.log(`[Room ${this.id}] Player ${player.id} joined. Total: ${this.players.size}/${this.maxPlayers}`);
 
-    this.addEvent(RoomEventType.PLAYER_JOINED, {
+    this.addEvent(RoomEventType.PLAYER_JOINED, RoomEventCategory.PLAYER, {
       playerId: player.id,
       sessionId: player.sessionId,
-    });
+    }, { actorId: player.id, actorType: 'player' });
 
     if (this.players.size >= 1 && !this.isRunning) {
       this.start();
@@ -311,11 +375,11 @@ class Room {
         },
       });
 
-      this.addEvent(RoomEventType.PLAYER_LEFT, {
+      this.addEvent(RoomEventType.PLAYER_LEFT, RoomEventCategory.PLAYER, {
         playerId,
         sessionId: player.sessionId,
         reason,
-      });
+      }, { actorId: playerId, actorType: 'player' });
 
       console.log(`[Room ${this.id}] Player ${playerId} left. Reason: ${reason}. Remaining: ${this.players.size}`);
     } else {
@@ -339,11 +403,11 @@ class Room {
         },
       });
 
-      this.addEvent(RoomEventType.PLAYER_DISCONNECTED, {
+      this.addEvent(RoomEventType.PLAYER_DISCONNECTED, RoomEventCategory.PLAYER, {
         playerId,
         sessionId: player.sessionId,
         reconnectTimeoutMs: this.config.reconnectTimeoutMs,
-      });
+      }, { actorId: playerId, actorType: 'system' });
 
       console.log(`[Room ${this.id}] Player ${playerId} disconnected, keeping state for reconnect (${this.config.reconnectTimeoutMs}ms window)`);
     }
@@ -503,11 +567,11 @@ class Room {
       },
     });
 
-    this.addEvent(RoomEventType.PLAYER_RECONNECTED, {
+    this.addEvent(RoomEventType.PLAYER_RECONNECTED, RoomEventCategory.PLAYER, {
       playerId: newPlayerId,
       sessionId,
       originalPlayerId: originalPlayerId !== newPlayerId ? originalPlayerId : undefined,
-    });
+    }, { actorId: newPlayerId, actorType: 'player' });
 
     if (this.emptyRoomDestroyTimer) {
       clearTimeout(this.emptyRoomDestroyTimer);
@@ -524,6 +588,7 @@ class Room {
       clearTimeout(existing.timeout);
     }
 
+    const disconnectedAt = Date.now();
     const timeout = setTimeout(() => {
       this.reconnectingSessions.delete(sessionId);
       if (!this.players.get(playerId)?.isConnected) {
@@ -531,7 +596,7 @@ class Room {
       }
     }, this.config.reconnectTimeoutMs);
 
-    this.reconnectingSessions.set(sessionId, { playerId, timeout });
+    this.reconnectingSessions.set(sessionId, { playerId, timeout, disconnectedAt });
     console.log(`[Room ${this.id}] Scheduled reconnect window for player ${playerId} (${this.config.reconnectTimeoutMs}ms)`);
 
     if (this.emptyRoomDestroyTimer) {
@@ -542,7 +607,27 @@ class Room {
     this.scheduleEmptyRoomDestroy();
   }
 
-  kickPlayer(playerId: string, reason: string = 'Kicked by admin'): boolean {
+  private getReconnectStatus(disconnectedAt: number): { status: ReconnectStatus; remainingMs: number; elapsedMs: number; totalMs: number } {
+    const now = Date.now();
+    const elapsedMs = now - disconnectedAt;
+    const totalMs = this.config.reconnectTimeoutMs;
+    const remainingMs = Math.max(0, totalMs - elapsedMs);
+
+    let status: ReconnectStatus;
+    if (remainingMs <= 0) {
+      status = ReconnectStatus.EXPIRED;
+    } else if (remainingMs <= totalMs * 0.2) {
+      status = ReconnectStatus.WARNING;
+    } else if (elapsedMs <= 3000) {
+      status = ReconnectStatus.FRESH;
+    } else {
+      status = ReconnectStatus.NORMAL;
+    }
+
+    return { status, remainingMs, elapsedMs, totalMs };
+  }
+
+  kickPlayer(playerId: string, reason: string = 'Kicked by admin', actorId?: string, actorType?: 'player' | 'spectator' | 'admin' | 'system'): boolean {
     const player = this.players.get(playerId);
     if (!player) return false;
 
@@ -554,58 +639,99 @@ class Room {
       this.reconnectingSessions.delete(sessionId);
     }
 
+    this.sessionIdToPlayerId.delete(sessionId);
     this.removePlayer(playerId, reason);
 
-    this.addEvent(RoomEventType.PLAYER_KICKED, {
+    this.addEvent(RoomEventType.PLAYER_KICKED, RoomEventCategory.ADMIN, {
       playerId,
       sessionId,
       reason,
-    });
+    }, { actorId: actorId ?? 'system', actorType: actorType ?? 'admin' });
 
     console.log(`[Room ${this.id}] Player ${playerId} kicked. Reason: ${reason}`);
     return true;
   }
 
-  lock(reason: string = 'Admin locked'): boolean {
+  lock(reason: string = 'Admin locked', actorId?: string, actorType?: 'player' | 'spectator' | 'admin' | 'system'): boolean {
     if (this.isLocked) return false;
 
     this.isLocked = true;
     this.lockReason = reason;
     this.lockedAt = Date.now();
 
-    this.addEvent(RoomEventType.ROOM_LOCKED, { reason });
+    this.addEvent(RoomEventType.ROOM_LOCKED, RoomEventCategory.ADMIN, { reason }, {
+      actorId: actorId ?? 'system',
+      actorType: actorType ?? 'admin',
+    });
 
     console.log(`[Room ${this.id}] Locked. Reason: ${reason}`);
     return true;
   }
 
-  unlock(): boolean {
+  unlock(actorId?: string, actorType?: 'player' | 'spectator' | 'admin' | 'system'): boolean {
     if (!this.isLocked) return false;
 
     this.isLocked = false;
     this.lockReason = null;
     this.lockedAt = null;
 
-    this.addEvent(RoomEventType.ROOM_UNLOCKED, {});
+    this.addEvent(RoomEventType.ROOM_UNLOCKED, RoomEventCategory.ADMIN, {}, {
+      actorId: actorId ?? 'system',
+      actorType: actorType ?? 'admin',
+    });
 
     console.log(`[Room ${this.id}] Unlocked`);
     return true;
   }
 
-  sendSystemAnnouncement(text: string): void {
-    this.broadcastToAll({
+  sendSystemAnnouncement(
+    text: string,
+    target: AnnouncementTarget = AnnouncementTarget.ALL,
+    senderId?: string,
+    senderType?: 'player' | 'spectator' | 'admin' | 'system'
+  ): void {
+    const now = Date.now();
+    const message = {
       type: MessageType.SYSTEM_ANNOUNCEMENT,
-      timestamp: Date.now(),
+      timestamp: now,
       payload: {
         roomId: this.id,
         text,
-        timestamp: Date.now(),
+        target,
+        timestamp: now,
       },
-    });
+    } as const;
 
-    this.addEvent(RoomEventType.SYSTEM_ANNOUNCEMENT, { text });
+    switch (target) {
+      case AnnouncementTarget.PLAYERS_ONLY:
+        this.broadcast(message as Omit<NetworkMessage<unknown>, 'seq'>);
+        break;
+      case AnnouncementTarget.SPECTATORS_ONLY:
+        this.broadcastToSpectators(message as Omit<NetworkMessage<unknown>, 'seq'>);
+        break;
+      case AnnouncementTarget.ALL:
+      default:
+        this.broadcastToAll(message as Omit<NetworkMessage<unknown>, 'seq'>);
+        break;
+    }
 
-    console.log(`[Room ${this.id}] System announcement: ${text}`);
+    this.lastAnnouncement = {
+      text,
+      timestamp: now,
+      target,
+      senderId,
+    };
+
+    this.addEvent(RoomEventType.SYSTEM_ANNOUNCEMENT, RoomEventCategory.ADMIN, {
+      text,
+      target,
+    }, { actorId: senderId ?? 'system', actorType: senderType ?? 'admin' });
+
+    console.log(`[Room ${this.id}] System announcement [${target}]: ${text}`);
+  }
+
+  getLastAnnouncement(): { text: string; timestamp: number; target: AnnouncementTarget; senderId?: string } | null {
+    return this.lastAnnouncement;
   }
 
   processPlayerInput(playerId: string, input: PlayerInput): void {
@@ -892,10 +1018,10 @@ class Room {
       },
     }, spectator.id);
 
-    this.addEvent(RoomEventType.SPECTATOR_JOINED, {
+    this.addEvent(RoomEventType.SPECTATOR_JOINED, RoomEventCategory.SPECTATOR, {
       spectatorId: spectator.id,
       sessionId: spectator.sessionId,
-    });
+    }, { actorId: spectator.id, actorType: 'spectator' });
 
     if (this.emptyRoomDestroyTimer) {
       clearTimeout(this.emptyRoomDestroyTimer);
@@ -934,11 +1060,11 @@ class Room {
       },
     });
 
-    this.addEvent(RoomEventType.SPECTATOR_LEFT, {
+    this.addEvent(RoomEventType.SPECTATOR_LEFT, RoomEventCategory.SPECTATOR, {
       spectatorId,
       sessionId: spectator.sessionId,
       reason,
-    });
+    }, { actorId: spectatorId, actorType: 'spectator' });
 
     console.log(`[Room ${this.id}] Spectator ${spectatorId} left. Reason: ${reason}. Remaining: ${this.spectators.size}`);
     this.scheduleEmptyRoomDestroy();
@@ -952,8 +1078,8 @@ class Room {
     return Array.from(this.spectators.values());
   }
 
-  pause(reason: string = 'Manual pause'): boolean {
-    if (!this.isRunning) {
+  pause(reason: string = 'Manual pause', actorId?: string, actorType?: 'player' | 'spectator' | 'admin' | 'system'): boolean {
+    if (!this.isRunning || this.isPaused) {
       return false;
     }
 
@@ -962,6 +1088,8 @@ class Room {
     this.pausedAt = Date.now();
     this.gameLoop.stop();
 
+    const pausedFrame = this.getCurrentFrame();
+
     this.broadcastToAll({
       type: MessageType.ROOM_PAUSE,
       timestamp: Date.now(),
@@ -969,20 +1097,20 @@ class Room {
         roomId: this.id,
         reason,
         pausedAt: this.pausedAt,
-        frame: this.getCurrentFrame(),
+        frame: pausedFrame,
       },
     });
 
-    this.addEvent(RoomEventType.ROOM_PAUSED, {
+    this.addEvent(RoomEventType.ROOM_PAUSED, RoomEventCategory.ADMIN, {
       reason,
-      frame: this.getCurrentFrame(),
-    });
+      frame: pausedFrame,
+    }, { actorId: actorId ?? 'system', actorType: actorType ?? 'admin' });
 
-    console.log(`[Room ${this.id}] Paused. Reason: ${reason}. Frame: ${this.getCurrentFrame()}`);
+    console.log(`[Room ${this.id}] Paused. Reason: ${reason}. Frame: ${pausedFrame}`);
     return true;
   }
 
-  resume(): boolean {
+  resume(actorId?: string, actorType?: 'player' | 'spectator' | 'admin' | 'system'): boolean {
     if (!this.isRunning || !this.isPaused) {
       return false;
     }
@@ -1003,9 +1131,9 @@ class Room {
       },
     });
 
-    this.addEvent(RoomEventType.ROOM_RESUMED, {
+    this.addEvent(RoomEventType.ROOM_RESUMED, RoomEventCategory.ADMIN, {
       frame: resumedFrame,
-    });
+    }, { actorId: actorId ?? 'system', actorType: actorType ?? 'admin' });
 
     console.log(`[Room ${this.id}] Resumed. Continuing from frame: ${resumedFrame}`);
     return true;
@@ -1070,7 +1198,15 @@ class Room {
     currentFrame: number;
     createdAt: number;
     onlinePlayers: Array<{ id: string; sessionId: string; rtt: number }>;
-    reconnectingPlayers: Array<{ sessionId: string; playerId: string; timeoutRemainingMs: number }>;
+    reconnectingPlayers: Array<{
+      sessionId: string;
+      playerId: string;
+      timeoutRemainingMs: number;
+      elapsedMs: number;
+      totalMs: number;
+      status: ReconnectStatus;
+      disconnectedAt: number;
+    }>;
     spectators: Array<{ id: string; sessionId: string }>;
     spectatorCount: number;
     reconnectingCount: number;
@@ -1079,6 +1215,7 @@ class Room {
     hasEmptyRoomDestroyTimer: boolean;
     emptyRoomDestroyRemainingMs: number | null;
     gameLoopStats: unknown;
+    lastAnnouncement: { text: string; timestamp: number; target: AnnouncementTarget; senderId?: string } | null;
     recentEvents?: RoomEvent[];
   } {
     const onlinePlayers = Array.from(this.players.values())
@@ -1090,19 +1227,25 @@ class Room {
       }));
 
     const now = Date.now();
-    const reconnectingPlayers: Array<{ sessionId: string; playerId: string; timeoutRemainingMs: number }> = [];
+    const reconnectingPlayers: Array<{
+      sessionId: string;
+      playerId: string;
+      timeoutRemainingMs: number;
+      elapsedMs: number;
+      totalMs: number;
+      status: ReconnectStatus;
+      disconnectedAt: number;
+    }> = [];
     for (const [sessionId, entry] of this.reconnectingSessions) {
-      const entryTyped = entry as { playerId: string; timeout: NodeJS.Timeout & { _idleStart?: number; _idleTimeout?: number } };
-      const timeoutObj = entryTyped.timeout;
-      let remaining = -1;
-      if (timeoutObj._idleStart !== undefined && timeoutObj._idleTimeout !== undefined) {
-        const elapsed = now - timeoutObj._idleStart;
-        remaining = Math.max(0, timeoutObj._idleTimeout - elapsed);
-      }
+      const { status, remainingMs, elapsedMs, totalMs } = this.getReconnectStatus(entry.disconnectedAt);
       reconnectingPlayers.push({
         sessionId,
-        playerId: entryTyped.playerId,
-        timeoutRemainingMs: remaining,
+        playerId: entry.playerId,
+        timeoutRemainingMs: remainingMs,
+        elapsedMs,
+        totalMs,
+        status,
+        disconnectedAt: entry.disconnectedAt,
       });
     }
 
@@ -1141,6 +1284,7 @@ class Room {
       hasEmptyRoomDestroyTimer: this.emptyRoomDestroyTimer !== null,
       emptyRoomDestroyRemainingMs: emptyRoomDestroyRemaining,
       gameLoopStats: this.gameLoop.getStats(),
+      lastAnnouncement: this.lastAnnouncement,
     };
 
     if (includeRecentEvents) {
@@ -1293,7 +1437,12 @@ export class RoomManager extends EventEmitter {
         if (anyRoomId) {
           const room = this.rooms.get(anyRoomId);
           if (room) {
-            room.pause((message.payload as { reason?: string })?.reason ?? 'Client requested pause');
+            const isSpectator = spectatorRoomId !== undefined;
+            room.pause(
+              (message.payload as { reason?: string })?.reason ?? 'Client requested pause',
+              player.id,
+              isSpectator ? 'spectator' : 'player'
+            );
           }
         }
         break;
@@ -1301,7 +1450,8 @@ export class RoomManager extends EventEmitter {
         if (anyRoomId) {
           const room = this.rooms.get(anyRoomId);
           if (room) {
-            room.resume();
+            const isSpectator = spectatorRoomId !== undefined;
+            room.resume(player.id, isSpectator ? 'spectator' : 'player');
           }
         }
         break;
@@ -1329,12 +1479,53 @@ export class RoomManager extends EventEmitter {
           }
         }
         break;
+      case MessageType.ROOM_EVENTS_QUERY:
+        if (anyRoomId) {
+          const room = this.rooms.get(anyRoomId);
+          if (room) {
+            const queryPayload = message.payload as {
+              categories?: string[];
+              types?: string[];
+              since?: number;
+              until?: number;
+              limit?: number;
+              eventId?: string;
+            };
+            if (queryPayload.eventId) {
+              const event = room.getEventById(queryPayload.eventId);
+              this.network.send(player.id, {
+                type: MessageType.ROOM_EVENTS_QUERY_ACK,
+                timestamp: Date.now(),
+                payload: { event, events: event ? [event] : [] },
+              });
+            } else {
+              const events = room.queryEvents({
+                categories: queryPayload.categories as RoomEventCategory[] | undefined,
+                types: queryPayload.types as RoomEventType[] | undefined,
+                since: queryPayload.since,
+                until: queryPayload.until,
+                limit: queryPayload.limit,
+              });
+              this.network.send(player.id, {
+                type: MessageType.ROOM_EVENTS_QUERY_ACK,
+                timestamp: Date.now(),
+                payload: { events },
+              });
+            }
+          }
+        }
+        break;
       case MessageType.KICK_PLAYER:
         if (playerRoomId) {
           const room = this.rooms.get(playerRoomId);
           if (room) {
             const kickPayload = message.payload as { targetPlayerId: string; reason?: string };
-            const ok = room.kickPlayer(kickPayload.targetPlayerId, kickPayload.reason ?? 'Kicked');
+            const ok = room.kickPlayer(
+              kickPayload.targetPlayerId,
+              kickPayload.reason ?? 'Kicked',
+              player.id,
+              'player'
+            );
             if (ok) {
               this.playerToRoom.delete(kickPayload.targetPlayerId);
             }
@@ -1345,7 +1536,11 @@ export class RoomManager extends EventEmitter {
         if (playerRoomId) {
           const room = this.rooms.get(playerRoomId);
           if (room) {
-            room.lock((message.payload as { reason?: string })?.reason ?? 'Locked');
+            room.lock(
+              (message.payload as { reason?: string })?.reason ?? 'Locked',
+              player.id,
+              'player'
+            );
           }
         }
         break;
@@ -1353,7 +1548,7 @@ export class RoomManager extends EventEmitter {
         if (playerRoomId) {
           const room = this.rooms.get(playerRoomId);
           if (room) {
-            room.unlock();
+            room.unlock(player.id, 'player');
           }
         }
         break;
@@ -1363,8 +1558,14 @@ export class RoomManager extends EventEmitter {
           if (roomId) {
             const room = this.rooms.get(roomId);
             if (room) {
-              const annPayload = message.payload as { text: string };
-              room.sendSystemAnnouncement(annPayload.text);
+              const annPayload = message.payload as { text: string; target?: AnnouncementTarget };
+              const isSpectator = spectatorRoomId !== undefined;
+              room.sendSystemAnnouncement(
+                annPayload.text,
+                annPayload.target ?? AnnouncementTarget.ALL,
+                player.id,
+                isSpectator ? 'spectator' : 'player'
+              );
             }
           }
         }

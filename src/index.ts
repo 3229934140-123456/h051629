@@ -55,17 +55,18 @@ export class GameServer {
     console.log('========================================');
     console.log();
     console.log('Available commands:');
-    console.log('  status                      - Show server statistics');
-    console.log('  rooms                       - List all active rooms');
-    console.log('  players                     - List all connected players');
-    console.log('  room <roomId>               - Show detailed debug status for a room');
-    console.log('  pause <roomId>              - Pause game loop for a room');
-    console.log('  resume <roomId>             - Resume game loop for a room');
-    console.log('  kick <roomId> <playerId>    - Kick a player from room');
-    console.log('  lock <roomId>               - Lock room (no new players)');
-    console.log('  unlock <roomId>             - Unlock room');
-    console.log('  announce <roomId> <text>    - Send system announcement');
-    console.log('  shutdown                    - Gracefully shutdown the server');
+    console.log('  status                             - Show server statistics');
+    console.log('  rooms                              - List all active rooms');
+    console.log('  players                            - List all connected players');
+    console.log('  room <roomId>                      - Show detailed debug status for a room');
+    console.log('  events <roomId> [--admin|--player] - Show room event audit log');
+    console.log('  pause <roomId>                     - Pause game loop for a room');
+    console.log('  resume <roomId>                    - Resume game loop for a room');
+    console.log('  kick <roomId> <playerId>           - Kick a player from room');
+    console.log('  lock <roomId>                      - Lock room (no new players)');
+    console.log('  unlock <roomId>                    - Unlock room');
+    console.log('  announce <roomId> [--players|--spectators] <text>  - Send system announcement');
+    console.log('  shutdown                           - Gracefully shutdown the server');
     console.log();
   }
 
@@ -210,7 +211,15 @@ if (require.main === module) {
             currentFrame: number;
             createdAt: number;
             onlinePlayers: Array<{ id: string; sessionId: string; rtt: number }>;
-            reconnectingPlayers: Array<{ sessionId: string; playerId: string; timeoutRemainingMs: number }>;
+            reconnectingPlayers: Array<{
+              sessionId: string;
+              playerId: string;
+              timeoutRemainingMs: number;
+              elapsedMs: number;
+              totalMs: number;
+              status: string;
+              disconnectedAt: number;
+            }>;
             spectators: Array<{ id: string; sessionId: string }>;
             spectatorCount: number;
             reconnectingCount: number;
@@ -219,7 +228,8 @@ if (require.main === module) {
             hasEmptyRoomDestroyTimer: boolean;
             emptyRoomDestroyRemainingMs: number | null;
             gameLoopStats: unknown;
-            recentEvents?: Array<{ id: string; type: string; timestamp: number; data: Record<string, unknown> }>;
+            lastAnnouncement: { text: string; timestamp: number; target: string; senderId?: string } | null;
+            recentEvents?: Array<{ id: string; type: string; category: string; timestamp: number; frame: number; actorId?: string; actorType?: string; data: Record<string, unknown> }>;
           };
           console.log(`\n[Room Debug Status] ${status.roomName}`);
           console.log(`  Room ID:        ${status.roomId}`);
@@ -233,6 +243,10 @@ if (require.main === module) {
           console.log(`  Spectators:     ${status.spectatorCount}`);
           if (status.hasEmptyRoomDestroyTimer) {
             console.log(`  Destroy Timer:  ${status.emptyRoomDestroyRemainingMs}ms remaining`);
+          }
+          if (status.lastAnnouncement) {
+            const ann = status.lastAnnouncement;
+            console.log(`  Last Announce:   [${ann.target}] ${ann.text} (${new Date(ann.timestamp).toLocaleTimeString()})`);
           }
           console.log();
           console.log('  [Online Players]');
@@ -249,10 +263,18 @@ if (require.main === module) {
           if (status.reconnectingPlayers.length === 0) {
             console.log('    (none)');
           } else {
+            const statusLabels: Record<string, string> = {
+              fresh: '刚掉线',
+              normal: '正常',
+              warning: '快超时',
+              expired: '已超时',
+            };
             status.reconnectingPlayers.forEach((rp) => {
-              const remaining = rp.timeoutRemainingMs >= 0 ? `${rp.timeoutRemainingMs}ms` : 'unknown';
-              console.log(`    - Player: ${rp.playerId.substring(0, 16)}..., Timeout: ${remaining}`);
+              const label = statusLabels[rp.status] ?? rp.status;
+              console.log(`    - [${label}] ${rp.playerId.substring(0, 16)}...`);
+              console.log(`      Remaining: ${rp.timeoutRemainingMs}ms / ${rp.totalMs}ms (${rp.elapsedMs}ms elapsed)`);
               console.log(`      Session: ${rp.sessionId.substring(0, 16)}...`);
+              console.log(`      Disconnected: ${new Date(rp.disconnectedAt).toLocaleTimeString()}`);
             });
           }
           console.log();
@@ -272,13 +294,55 @@ if (require.main === module) {
           } else {
             status.recentEvents.forEach((e) => {
               const timeStr = new Date(e.timestamp).toLocaleTimeString();
-              console.log(`    [${timeStr}] ${e.type}`);
-              console.log(`      ${JSON.stringify(e.data)}`);
+              const actorTag = e.actorId ? ` [by ${e.actorType}:${e.actorId.substring(0, 8)}]` : '';
+              console.log(`    [${timeStr}] ${e.category.toUpperCase()} ${e.type}${actorTag}`);
+              console.log(`      Frame: ${e.frame}, Data: ${JSON.stringify(e.data)}`);
             });
           }
           console.log();
           console.log('  [GameLoop Stats]');
           console.log(`    ${JSON.stringify(status.gameLoopStats, null, 6).split('\n').join('\n    ')}`);
+          console.log();
+          break;
+        }
+        case 'events': {
+          if (args.length === 0) {
+            console.log('Usage: events <roomId> [--admin] [--player] [--spectator] [--system] [--limit N]');
+            break;
+          }
+          const roomId = args[0];
+          const room = server.getRoomManager().getRoom(roomId);
+          if (!room) {
+            console.log(`Room not found: ${roomId}`);
+            break;
+          }
+          const flags = args.slice(1).filter(a => a.startsWith('--'));
+          const limitArg = args.find(a => a.startsWith('--limit='));
+          const limit = limitArg ? parseInt(limitArg.split('=')[1], 10) : 30;
+          const categories: string[] = [];
+          if (flags.includes('--admin')) categories.push('admin');
+          if (flags.includes('--player')) categories.push('player');
+          if (flags.includes('--spectator')) categories.push('spectator');
+          if (flags.includes('--system')) categories.push('system');
+
+          const events = (room as unknown as {
+            queryEvents: (opts: { categories?: string[]; limit?: number }) => Array<{
+              id: string; type: string; category: string; timestamp: number;
+              frame: number; actorId?: string; actorType?: string; data: Record<string, unknown>;
+            }>;
+          }).queryEvents({ categories: categories.length > 0 ? categories : undefined, limit });
+
+          console.log(`\n[Room Event Log] ${roomId} (${events.length} events)`);
+          if (events.length === 0) {
+            console.log('  (no events)');
+          } else {
+            events.forEach((e) => {
+              const timeStr = new Date(e.timestamp).toLocaleTimeString();
+              const actorTag = e.actorId ? ` [by ${e.actorType}:${e.actorId.substring(0, 8)}]` : '';
+              console.log(`  [${timeStr}] ${e.category.toUpperCase().padEnd(9)} ${e.type}${actorTag}`);
+              console.log(`    Frame: ${e.frame}, Data: ${JSON.stringify(e.data)}`);
+            });
+          }
           console.log();
           break;
         }
@@ -294,7 +358,7 @@ if (require.main === module) {
             console.log(`Room not found: ${roomId}`);
             break;
           }
-          const ok = room.pause(reason);
+          const ok = room.pause(reason, 'console', 'admin');
           console.log(ok ? `Room ${roomId} paused successfully` : `Failed to pause room ${roomId} (not running?)`);
           break;
         }
@@ -309,7 +373,7 @@ if (require.main === module) {
             console.log(`Room not found: ${roomId}`);
             break;
           }
-          const ok = room.resume();
+          const ok = room.resume('console', 'admin');
           console.log(ok ? `Room ${roomId} resumed successfully` : `Failed to resume room ${roomId} (not running or not paused?)`);
           break;
         }
@@ -326,8 +390,13 @@ if (require.main === module) {
             console.log(`Room not found: ${roomId}`);
             break;
           }
-          const ok = room.kickPlayer(playerId, reason);
-          console.log(ok ? `Player ${playerId} kicked from room ${roomId}` : `Failed to kick player ${playerId} (not found?)`);
+          const ok = room.kickPlayer(playerId, reason, 'console', 'admin');
+          if (ok) {
+            server.getRoomManager()['playerToRoom'].delete(playerId);
+            console.log(`Player ${playerId} kicked from room ${roomId}`);
+          } else {
+            console.log(`Failed to kick player ${playerId} (not found?)`);
+          }
           break;
         }
         case 'lock': {
@@ -342,7 +411,7 @@ if (require.main === module) {
             console.log(`Room not found: ${roomId}`);
             break;
           }
-          const ok = room.lock(reason);
+          const ok = room.lock(reason, 'console', 'admin');
           console.log(ok ? `Room ${roomId} locked successfully` : `Failed to lock room ${roomId} (already locked?)`);
           break;
         }
@@ -357,24 +426,34 @@ if (require.main === module) {
             console.log(`Room not found: ${roomId}`);
             break;
           }
-          const ok = room.unlock();
+          const ok = room.unlock('console', 'admin');
           console.log(ok ? `Room ${roomId} unlocked successfully` : `Failed to unlock room ${roomId} (not locked?)`);
           break;
         }
         case 'announce': {
           if (args.length < 2) {
-            console.log('Usage: announce <roomId> <text>');
+            console.log('Usage: announce <roomId> [--players|--spectators] <text>');
             break;
           }
           const roomId = args[0];
-          const text = args.slice(1).join(' ');
+          let target = 'all';
+          let textStartIdx = 1;
+          if (args[1] === '--players') { target = 'players_only'; textStartIdx = 2; }
+          else if (args[1] === '--spectators') { target = 'spectators_only'; textStartIdx = 2; }
+          const text = args.slice(textStartIdx).join(' ');
+          if (!text) {
+            console.log('Announcement text cannot be empty');
+            break;
+          }
           const room = server.getRoomManager().getRoom(roomId);
           if (!room) {
             console.log(`Room not found: ${roomId}`);
             break;
           }
-          room.sendSystemAnnouncement(text);
-          console.log(`Announcement sent to room ${roomId}`);
+          (room as unknown as {
+            sendSystemAnnouncement: (t: string, target: string, s: string, st: string) => void;
+          }).sendSystemAnnouncement(text, target, 'console', 'admin');
+          console.log(`Announcement sent to room ${roomId} [${target}]: ${text}`);
           break;
         }
         case 'shutdown':
@@ -384,18 +463,19 @@ if (require.main === module) {
           break;
         case 'help':
           console.log('\nAvailable commands:');
-          console.log('  status                      - Show server statistics');
-          console.log('  rooms                       - List all active rooms');
-          console.log('  players                     - List all connected players');
-          console.log('  room <roomId>               - Show detailed debug status for a room');
-          console.log('  pause <roomId>              - Pause game loop for a room');
-          console.log('  resume <roomId>             - Resume game loop for a room');
-          console.log('  kick <roomId> <playerId>    - Kick a player from room');
-          console.log('  lock <roomId>               - Lock room (no new players)');
-          console.log('  unlock <roomId>             - Unlock room');
-          console.log('  announce <roomId> <text>    - Send system announcement');
-          console.log('  shutdown                    - Gracefully shutdown the server');
-          console.log('  help                        - Show this help message');
+          console.log('  status                             - Show server statistics');
+          console.log('  rooms                              - List all active rooms');
+          console.log('  players                            - List all connected players');
+          console.log('  room <roomId>                      - Show detailed debug status for a room');
+          console.log('  events <roomId> [--admin|--player] - Show room event audit log');
+          console.log('  pause <roomId>                     - Pause game loop for a room');
+          console.log('  resume <roomId>                    - Resume game loop for a room');
+          console.log('  kick <roomId> <playerId>           - Kick a player from room');
+          console.log('  lock <roomId>                      - Lock room (no new players)');
+          console.log('  unlock <roomId>                    - Unlock room');
+          console.log('  announce <roomId> [--players|--spectators] <text>  - Send system announcement');
+          console.log('  shutdown                           - Gracefully shutdown the server');
+          console.log('  help                               - Show this help message');
           console.log();
           break;
         case '':
