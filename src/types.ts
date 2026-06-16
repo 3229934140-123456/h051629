@@ -66,6 +66,8 @@ export interface PlayerInput {
   frame: number;
   inputData: InputData;
   timestamp: number;
+  predictedPosition?: { x: number; y: number; z?: number };
+  predictedVelocity?: { x: number; y: number; z?: number };
 }
 
 export interface InputData {

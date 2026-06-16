@@ -38,6 +38,8 @@ export class GameLoop extends EventEmitter {
   private accumulator = 0;
   private currentFrame = 0;
   private tickInterval: number;
+  private isProcessingFrame = false;
+  private pendingFrames = 0;
 
   private slowOperationQueue: SlowOperation[] = [];
   private pendingSlowOperations: Map<string, SlowOperation> = new Map();
@@ -81,7 +83,7 @@ export class GameLoop extends EventEmitter {
     console.log('[GameLoop] Game loop stopped');
   }
 
-  private runLoop = (): void => {
+  private runLoop = async (): Promise<void> => {
     if (!this.isRunning) return;
 
     const now = process.hrtime.bigint();
@@ -90,9 +92,22 @@ export class GameLoop extends EventEmitter {
 
     this.accumulator += frameTime;
 
-    while (this.accumulator >= this.tickInterval) {
-      this.processFrame();
+    while (this.accumulator >= this.tickInterval && !this.isProcessingFrame) {
+      this.pendingFrames++;
       this.accumulator -= this.tickInterval;
+    }
+
+    if (!this.isProcessingFrame && this.pendingFrames > 0) {
+      this.isProcessingFrame = true;
+      
+      try {
+        while (this.pendingFrames > 0) {
+          this.pendingFrames--;
+          await this.processFrame();
+        }
+      } finally {
+        this.isProcessingFrame = false;
+      }
     }
 
     this.processSlowOperations();
@@ -104,8 +119,9 @@ export class GameLoop extends EventEmitter {
   private async processFrame(): Promise<void> {
     const frameStartTime = Date.now();
     this.currentFrame++;
+    const frameNumber = this.currentFrame;
 
-    const frameInputs = this.inputBuffer.getInputsForFrame(this.currentFrame);
+    const frameInputs = this.inputBuffer.getInputsForFrame(frameNumber);
     const deltaTime = this.tickInterval / 1000;
 
     const currentState = this.stateSynchronizer.getCurrentState();
@@ -118,14 +134,20 @@ export class GameLoop extends EventEmitter {
 
     if (this.gameLogic) {
       try {
-        const result = this.gameLogic(this.currentFrame, deltaTime, frameInputs, playerStates);
+        const result = this.gameLogic(frameNumber, deltaTime, frameInputs, playerStates);
         
         if (result instanceof Promise) {
           const executeTime = Date.now();
+          let timedOut = false;
+          
           newStates = await Promise.race([
-            result,
+            result.then((resolved) => {
+              if (!timedOut) return resolved;
+              throw new Error('Result arrived after timeout, discarded to preserve frame order');
+            }),
             new Promise<Map<string, PlayerState>>((_, reject) => {
               setTimeout(() => {
+                timedOut = true;
                 reject(new Error('Game logic timeout'));
               }, this.config.slowOperationTimeoutMs);
             }),
@@ -133,29 +155,34 @@ export class GameLoop extends EventEmitter {
           
           const totalTime = Date.now() - executeTime;
           if (totalTime > this.config.slowOperationTimeoutMs) {
-            console.warn(`[GameLoop] Frame ${this.currentFrame} game logic took ${totalTime}ms, exceeding threshold ${this.config.slowOperationTimeoutMs}ms`);
+            console.warn(`[GameLoop] Frame ${frameNumber} game logic took ${totalTime}ms, exceeding threshold ${this.config.slowOperationTimeoutMs}ms`);
           }
         } else {
           newStates = result;
         }
       } catch (error) {
-        console.error(`[GameLoop] Error in game logic for frame ${this.currentFrame}:`, error);
+        console.error(`[GameLoop] Error in game logic for frame ${frameNumber}:`, error);
         newStates = playerStates;
       }
     } else {
-      newStates = this.defaultGameLogic(this.currentFrame, deltaTime, frameInputs, playerStates);
+      newStates = this.defaultGameLogic(frameNumber, deltaTime, frameInputs, playerStates);
     }
 
-    this.stateSynchronizer.applyFrameUpdate(this.currentFrame, newStates);
-    this.stateSynchronizer.saveHistorySnapshot(this.currentFrame, frameInputs as Map<string, unknown>);
+    if (frameNumber !== this.currentFrame) {
+      console.error(`[GameLoop] Frame ${frameNumber} completed but currentFrame is already ${this.currentFrame}, skipping state update to prevent order violation`);
+      return;
+    }
+
+    this.stateSynchronizer.applyFrameUpdate(frameNumber, newStates);
+    this.stateSynchronizer.saveHistorySnapshot(frameNumber, frameInputs as Map<string, unknown>);
 
     const frameDuration = Date.now() - frameStartTime;
     if (frameDuration > this.config.slowOperationTimeoutMs) {
-      console.warn(`[GameLoop] Frame ${this.currentFrame} total processing took ${frameDuration}ms`);
+      console.warn(`[GameLoop] Frame ${frameNumber} total processing took ${frameDuration}ms`);
     }
 
     this.emit('frame-complete', {
-      frame: this.currentFrame,
+      frame: frameNumber,
       duration: frameDuration,
       inputs: frameInputs,
       state: this.stateSynchronizer.getCurrentState(),
@@ -313,6 +340,8 @@ export class GameLoop extends EventEmitter {
     tickInterval: number;
     pendingSlowOps: number;
     queuedSlowOps: number;
+    isProcessingFrame: boolean;
+    pendingFrames: number;
   } {
     return {
       currentFrame: this.currentFrame,
@@ -320,6 +349,8 @@ export class GameLoop extends EventEmitter {
       tickInterval: this.tickInterval,
       pendingSlowOps: this.pendingSlowOperations.size,
       queuedSlowOps: this.slowOperationQueue.length,
+      isProcessingFrame: this.isProcessingFrame,
+      pendingFrames: this.pendingFrames,
     };
   }
 }

@@ -293,4 +293,22 @@ export class StateSynchronizer {
   getLatestFrame(): number {
     return this.currentState.frame;
   }
+
+  renamePlayer(oldId: string, newId: string): void {
+    const playerState = this.currentState.players.get(oldId);
+    if (playerState) {
+      this.currentState.players.delete(oldId);
+      playerState.id = newId;
+      this.currentState.players.set(newId, playerState);
+    }
+
+    for (const snapshot of this.history) {
+      const state = snapshot.state.players.get(oldId);
+      if (state) {
+        snapshot.state.players.delete(oldId);
+        state.id = newId;
+        snapshot.state.players.set(newId, state);
+      }
+    }
+  }
 }

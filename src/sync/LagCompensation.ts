@@ -226,7 +226,7 @@ export class LagCompensation {
     };
   }
 
-  private calculateDistance(
+  calculateDistance(
     a: { x: number; y: number; z?: number },
     b: { x: number; y: number; z?: number }
   ): number {

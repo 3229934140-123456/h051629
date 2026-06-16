@@ -45,8 +45,10 @@ export class InputBuffer {
 
   getInputsForFrame(frame: number): Map<string, PlayerInput[]> {
     const result = new Map<string, PlayerInput[]>();
+    const playerIds = Array.from(this.playerBuffers.keys()).sort();
 
-    for (const [playerId, buffer] of this.playerBuffers) {
+    for (const playerId of playerIds) {
+      const buffer = this.playerBuffers.get(playerId)!;
       const inputs: PlayerInput[] = [];
       const buffered = buffer.get(frame);
       
@@ -65,6 +67,10 @@ export class InputBuffer {
       if (inputs.length > 0) {
         result.set(playerId, inputs);
       }
+    }
+
+    if (this._onInputReady) {
+      this._onInputReady(result, frame);
     }
 
     return result;
@@ -132,6 +138,20 @@ export class InputBuffer {
   removePlayer(playerId: string): void {
     this.playerBuffers.delete(playerId);
     this.lastProcessedFrame.delete(playerId);
+  }
+
+  renamePlayer(oldId: string, newId: string): void {
+    const buffer = this.playerBuffers.get(oldId);
+    if (buffer) {
+      this.playerBuffers.delete(oldId);
+      this.playerBuffers.set(newId, buffer);
+    }
+
+    const lastProcessed = this.lastProcessedFrame.get(oldId);
+    if (lastProcessed !== undefined) {
+      this.lastProcessedFrame.delete(oldId);
+      this.lastProcessedFrame.set(newId, lastProcessed);
+    }
   }
 
   clearAll(): void {

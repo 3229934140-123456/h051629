@@ -42,6 +42,9 @@ class Room {
 
   private lastDeltaFrame: Map<string, number> = new Map();
   private playerAckedFrames: Map<string, number> = new Map();
+  private playerPredictedStates: Map<string, Map<number, { position: { x: number; y: number; z?: number }; velocity?: { x: number; y: number; z?: number } }>> = new Map();
+  private sessionIdToPlayerId: Map<string, string> = new Map();
+  private _lastCorrectionFrame: Map<string, number> = new Map();
   private syncTimer: NodeJS.Timeout | null = null;
   private deltaSyncTimer: NodeJS.Timeout | null = null;
   private network: NetworkLayer;
@@ -140,9 +143,11 @@ class Room {
     }
 
     this.players.set(player.id, player);
+    this.sessionIdToPlayerId.set(player.sessionId, player.id);
     this.network.setRoomId(player.id, this.id);
     this.lastDeltaFrame.set(player.id, 0);
     this.playerAckedFrames.set(player.id, 0);
+    this.playerPredictedStates.set(player.id, new Map());
 
     const initialPlayerState: PlayerState = {
       id: player.id,
@@ -190,37 +195,53 @@ class Room {
     return { success: true };
   }
 
-  removePlayer(playerId: string, reason: string = 'Player left'): void {
+  removePlayer(playerId: string, reason: string = 'Player left', isDisconnect: boolean = false): void {
     const player = this.players.get(playerId);
     if (!player) return;
 
-    this.players.delete(playerId);
-    this.lastDeltaFrame.delete(playerId);
-    this.playerAckedFrames.delete(playerId);
-    this.network.setRoomId(playerId, null);
+    if (!isDisconnect) {
+      this.players.delete(playerId);
+      this.sessionIdToPlayerId.delete(player.sessionId);
+      this.lastDeltaFrame.delete(playerId);
+      this.playerAckedFrames.delete(playerId);
+      this.playerPredictedStates.delete(playerId);
+      this.network.setRoomId(playerId, null);
 
-    this.stateSynchronizer.removePlayer(playerId);
-    this.inputBuffer.removePlayer(playerId);
+      this.stateSynchronizer.removePlayer(playerId);
+      this.inputBuffer.removePlayer(playerId);
 
-    this.network.send(playerId, {
-      type: MessageType.LEAVE_ROOM,
-      timestamp: Date.now(),
-      payload: {
-        roomId: this.id,
-        reason,
-      },
-    });
+      this.network.send(playerId, {
+        type: MessageType.LEAVE_ROOM,
+        timestamp: Date.now(),
+        payload: {
+          roomId: this.id,
+          reason,
+        },
+      });
 
-    this.broadcast({
-      type: MessageType.LEAVE_ROOM,
-      timestamp: Date.now(),
-      payload: {
-        playerId,
-        reason,
-      },
-    });
+      this.broadcast({
+        type: MessageType.LEAVE_ROOM,
+        timestamp: Date.now(),
+        payload: {
+          playerId,
+          reason,
+        },
+      });
 
-    console.log(`[Room ${this.id}] Player ${playerId} left. Reason: ${reason}. Remaining: ${this.players.size}`);
+      console.log(`[Room ${this.id}] Player ${playerId} left. Reason: ${reason}. Remaining: ${this.players.size}`);
+    } else {
+      player.isConnected = false;
+      this.broadcast({
+        type: MessageType.LEAVE_ROOM,
+        timestamp: Date.now(),
+        payload: {
+          playerId,
+          reason: 'disconnect',
+          isTemporary: true,
+        },
+      });
+      console.log(`[Room ${this.id}] Player ${playerId} disconnected, keeping state for reconnect`);
+    }
 
     if (this.isEmpty() && this.isRunning) {
       setTimeout(() => {
@@ -231,41 +252,122 @@ class Room {
     }
   }
 
-  handleReconnect(playerId: string, sessionId: string, lastKnownFrame: number): { success: boolean; reason?: string } {
+  handleReconnect(newPlayerId: string, sessionId: string, lastKnownFrame: number, newConnection?: PlayerConnection): { success: boolean; reason?: string } {
     const reconnectEntry = this.reconnectingSessions.get(sessionId);
-    if (!reconnectEntry || reconnectEntry.playerId !== playerId) {
+    if (!reconnectEntry) {
       return { success: false, reason: 'Reconnect session not found or expired' };
+    }
+
+    const originalPlayerId = reconnectEntry.playerId;
+    const originalPlayer = this.players.get(originalPlayerId);
+    if (!originalPlayer) {
+      this.reconnectingSessions.delete(sessionId);
+      return { success: false, reason: 'Original player data not found' };
+    }
+
+    if (originalPlayer.sessionId !== sessionId) {
+      this.reconnectingSessions.delete(sessionId);
+      return { success: false, reason: 'Session ID mismatch' };
     }
 
     clearTimeout(reconnectEntry.timeout);
     this.reconnectingSessions.delete(sessionId);
 
-    const player = this.players.get(playerId);
-    if (!player) {
-      return { success: false, reason: 'Player not found in room' };
-    }
+    if (newPlayerId !== originalPlayerId) {
+      console.log(`[Room ${this.id}] Migrating player from ${originalPlayerId} to ${newPlayerId}`);
 
-    player.isConnected = true;
-    player.lastActivity = Date.now();
+      originalPlayer.id = newPlayerId;
+      if (newConnection) {
+        originalPlayer.isConnected = true;
+        originalPlayer.lastActivity = Date.now();
+        originalPlayer.rtt = newConnection.rtt;
+        originalPlayer.lastReceivedSeq = newConnection.lastReceivedSeq;
+        originalPlayer.lastSentSeq = newConnection.lastSentSeq;
+      } else {
+        originalPlayer.isConnected = true;
+        originalPlayer.lastActivity = Date.now();
+      }
+
+      this.players.delete(originalPlayerId);
+      this.players.set(newPlayerId, originalPlayer);
+
+      this.sessionIdToPlayerId.set(sessionId, newPlayerId);
+
+      const lastDelta = this.lastDeltaFrame.get(originalPlayerId);
+      const ackedFrame = this.playerAckedFrames.get(originalPlayerId);
+      const predictedStates = this.playerPredictedStates.get(originalPlayerId);
+      this.lastDeltaFrame.delete(originalPlayerId);
+      this.playerAckedFrames.delete(originalPlayerId);
+      this.playerPredictedStates.delete(originalPlayerId);
+      if (lastDelta !== undefined) this.lastDeltaFrame.set(newPlayerId, lastDelta);
+      if (ackedFrame !== undefined) this.playerAckedFrames.set(newPlayerId, ackedFrame);
+      if (predictedStates !== undefined) this.playerPredictedStates.set(newPlayerId, predictedStates);
+
+      this.network.setRoomId(originalPlayerId, null);
+      this.network.setRoomId(newPlayerId, this.id);
+
+      this.stateSynchronizer.renamePlayer(originalPlayerId, newPlayerId);
+      this.inputBuffer.renamePlayer(originalPlayerId, newPlayerId);
+
+      this.broadcast({
+        type: MessageType.JOIN_ROOM,
+        timestamp: Date.now(),
+        payload: {
+          playerId: newPlayerId,
+          sessionId,
+          playerState: this.stateSynchronizer.getCurrentState().players.get(newPlayerId),
+          isReconnect: true,
+          originalPlayerId,
+        },
+      }, newPlayerId);
+    } else {
+      originalPlayer.isConnected = true;
+      originalPlayer.lastActivity = Date.now();
+      if (newConnection) {
+        originalPlayer.rtt = newConnection.rtt;
+        originalPlayer.lastReceivedSeq = newConnection.lastReceivedSeq;
+        originalPlayer.lastSentSeq = newConnection.lastSentSeq;
+      }
+
+      this.broadcast({
+        type: MessageType.JOIN_ROOM,
+        timestamp: Date.now(),
+        payload: {
+          playerId: newPlayerId,
+          sessionId,
+          playerState: this.stateSynchronizer.getCurrentState().players.get(newPlayerId),
+          isReconnect: true,
+        },
+      }, newPlayerId);
+    }
 
     const currentFrame = this.stateSynchronizer.getLatestFrame();
     const baseFrame = Math.max(lastKnownFrame, currentFrame - this.config.maxHistorySnapshots);
     const recoveryState = this.stateSynchronizer.serializeForReconnection();
 
-    this.network.send(playerId, {
+    const playerList = Array.from(this.players.values()).map(p => ({
+      id: p.id,
+      sessionId: p.sessionId,
+      isConnected: p.isConnected,
+    }));
+
+    this.network.send(newPlayerId, {
       type: MessageType.RECONNECT_ACK,
       timestamp: Date.now(),
       payload: {
         success: true,
         roomId: this.id,
+        playerId: newPlayerId,
+        sessionId,
         state: this.serializeGameStateForClient(recoveryState.state),
         baseFrame,
         currentFrame,
         missedFrames: currentFrame - baseFrame,
+        players: playerList,
       },
     });
 
-    console.log(`[Room ${this.id}] Player ${playerId} reconnected. Catching up from frame ${baseFrame} to ${currentFrame}`);
+    console.log(`[Room ${this.id}] Player ${newPlayerId} reconnected successfully. Session: ${sessionId.substring(0, 8)}..., Frame catchup: ${baseFrame} → ${currentFrame}`);
     return { success: true };
   }
 
@@ -295,6 +397,26 @@ class Room {
       const currentAck = this.playerAckedFrames.get(playerId) ?? 0;
       if (input.frame > currentAck) {
         this.playerAckedFrames.set(playerId, input.frame);
+      }
+
+      if (input.predictedPosition) {
+        let predictedStates = this.playerPredictedStates.get(playerId);
+        if (!predictedStates) {
+          predictedStates = new Map();
+          this.playerPredictedStates.set(playerId, predictedStates);
+        }
+        predictedStates.set(input.frame, {
+          position: input.predictedPosition,
+          velocity: input.predictedVelocity,
+        });
+
+        const maxHistory = this.config.maxHistorySnapshots;
+        const minFrame = input.frame - maxHistory;
+        for (const f of predictedStates.keys()) {
+          if (f < minFrame) {
+            predictedStates.delete(f);
+          }
+        }
       }
     }
   }
@@ -350,9 +472,19 @@ class Room {
   }
 
   private checkAndSendCorrections(currentFrame: number): void {
+    const CORRECTION_THRESHOLD_POSITION = 0.5;
+    const CORRECTION_THRESHOLD_VELOCITY = 1.0;
+    const CORRECTION_COOLDOWN_FRAMES = 60;
+
     for (const [playerId, player] of this.players) {
+      if (!player.isConnected) continue;
+
       const ackedFrame = this.playerAckedFrames.get(playerId) ?? 0;
       if (ackedFrame <= 0) continue;
+
+      const predictedStates = this.playerPredictedStates.get(playerId);
+      const predictedState = predictedStates?.get(ackedFrame);
+      if (!predictedState) continue;
 
       const historySnapshot = this.stateSynchronizer.getHistorySnapshot(ackedFrame);
       if (!historySnapshot) continue;
@@ -360,25 +492,57 @@ class Room {
       const serverPlayerState = historySnapshot.state.players.get(playerId);
       if (!serverPlayerState) continue;
 
-      const clientEstimatedFrame = this.lagCompensation.estimateServerFrameFromClient(
-        ackedFrame,
-        player.rtt,
-        currentFrame
+      const predictedForCompare: PlayerState = {
+        id: playerId,
+        position: predictedState.position,
+        velocity: predictedState.velocity,
+        health: serverPlayerState.health,
+      };
+
+      const errorAnalysis = this.lagCompensation.calculateClientSidePredictionError(
+        serverPlayerState,
+        predictedForCompare
       );
 
-      if (Math.abs(currentFrame - clientEstimatedFrame) > 30) {
-        const correction = this.lagCompensation.generateCorrectionPayload(
+      const velocityExceeds = predictedState.velocity && serverPlayerState.velocity
+        ? this.lagCompensation.calculateDistance(predictedState.velocity, serverPlayerState.velocity) > CORRECTION_THRESHOLD_VELOCITY
+        : false;
+
+      const lastCorrectionFrame = this._lastCorrectionFrame;
+      const lastSent = lastCorrectionFrame?.get(playerId) ?? 0;
+      const cooldownElapsed = currentFrame - lastSent >= CORRECTION_COOLDOWN_FRAMES;
+
+      if ((errorAnalysis.needsCorrection || velocityExceeds) && cooldownElapsed) {
+        const correctionPayload = this.lagCompensation.generateCorrectionPayload(
           playerId,
           currentFrame,
           serverPlayerState,
           ackedFrame
         );
 
+        const correctionWithError = {
+          ...correctionPayload,
+          positionError: errorAnalysis.positionError,
+          velocityError: errorAnalysis.velocityError,
+          threshold: CORRECTION_THRESHOLD_POSITION,
+        };
+
         this.network.send(playerId, {
           type: MessageType.CORRECTION,
           timestamp: Date.now(),
-          payload: correction,
+          payload: correctionWithError,
         });
+
+        if (!lastCorrectionFrame) {
+          this._lastCorrectionFrame = new Map();
+        }
+        this._lastCorrectionFrame.set(playerId, currentFrame);
+
+        console.log(
+          `[Room ${this.id}] Sent correction for player ${playerId.substring(0, 8)}... ` +
+          `frame=${ackedFrame}, posError=${errorAnalysis.positionError.toFixed(3)}m, ` +
+          `velError=${errorAnalysis.velocityError?.toFixed(3) ?? 'N/A'}m/s`
+        );
       }
     }
   }
@@ -412,15 +576,15 @@ class Room {
   }
 
   isEmpty(): boolean {
-    return this.players.size === 0;
+    return Array.from(this.players.values()).filter(p => p.isConnected).length === 0;
   }
 
   isFull(): boolean {
-    return this.players.size >= this.maxPlayers;
+    return Array.from(this.players.values()).filter(p => p.isConnected).length >= this.maxPlayers;
   }
 
   getPlayerCount(): number {
-    return this.players.size;
+    return Array.from(this.players.values()).filter(p => p.isConnected).length;
   }
 
   getPlayer(playerId: string): PlayerConnection | undefined {
@@ -475,6 +639,7 @@ export class RoomManager extends EventEmitter {
       if (roomId) {
         const room = this.rooms.get(roomId);
         if (room) {
+          room.removePlayer(player.id, 'Disconnected', true);
           room.scheduleReconnect(player.id, player.sessionId);
         }
       }
@@ -555,41 +720,60 @@ export class RoomManager extends EventEmitter {
   }
 
   private handleReconnect(
-    player: PlayerConnection,
+    newConnection: PlayerConnection,
     payload: { sessionId: string; lastFrame: number }
   ): void {
-    const originalPlayerId = this.sessionToPlayer.get(payload.sessionId);
+    const { sessionId, lastFrame } = payload;
+    const originalPlayerId = this.sessionToPlayer.get(sessionId);
+    
     if (!originalPlayerId) {
-      this.network.sendError(player.id, 'Invalid reconnect session');
+      this.network.sendError(newConnection.id, 'Invalid reconnect session');
       return;
     }
 
     const roomId = this.playerToRoom.get(originalPlayerId);
     if (!roomId) {
-      this.network.sendError(player.id, 'No room to reconnect to');
+      this.network.sendError(newConnection.id, 'No room to reconnect to');
       return;
     }
 
     const room = this.rooms.get(roomId);
     if (!room) {
-      this.network.sendError(player.id, 'Room no longer exists');
+      this.network.sendError(newConnection.id, 'Room no longer exists');
       return;
     }
 
     const existingPlayer = room.getPlayer(originalPlayerId);
-    if (!existingPlayer || existingPlayer.sessionId !== payload.sessionId) {
-      this.network.sendError(player.id, 'Reconnect validation failed');
+    if (!existingPlayer) {
+      this.network.sendError(newConnection.id, 'Player not found in room');
       return;
     }
 
-    existingPlayer.id = player.id;
-    this.sessionToPlayer.set(player.sessionId, player.id);
-    this.playerToRoom.set(player.id, roomId);
-    this.playerToRoom.delete(originalPlayerId);
+    if (existingPlayer.sessionId !== sessionId) {
+      this.network.sendError(newConnection.id, 'Session ID mismatch');
+      return;
+    }
 
-    const result = room.handleReconnect(player.id, payload.sessionId, payload.lastFrame);
-    if (!result.success) {
-      this.network.sendError(player.id, result.reason ?? 'Reconnect failed');
+    const result = room.handleReconnect(
+      newConnection.id,
+      sessionId,
+      lastFrame,
+      newConnection
+    );
+
+    if (result.success) {
+      if (newConnection.id !== originalPlayerId) {
+        this.sessionToPlayer.delete(sessionId);
+        this.sessionToPlayer.set(sessionId, newConnection.id);
+        this.sessionToPlayer.set(newConnection.sessionId, newConnection.id);
+        
+        this.playerToRoom.delete(originalPlayerId);
+        this.playerToRoom.set(newConnection.id, roomId);
+      }
+      
+      console.log(`[RoomManager] Player ${newConnection.id} reconnected to room ${roomId} via session ${sessionId.substring(0, 8)}...`);
+    } else {
+      this.network.sendError(newConnection.id, result.reason ?? 'Reconnect failed');
     }
   }
 
